@@ -1,7 +1,9 @@
 
 import { tokenizeLuau, type LuauToken } from "../tokenizer";
+
 import {
   OPCODES,
+  type Opcode,
   type VMConstant,
   type VMInstruction,
   type VMProgram,
@@ -11,10 +13,13 @@ type ExpressionResult = {
   register: number;
 };
 
-const BINARY_OPERATORS: Record<
-  string,
-  { precedence: number; opcode: number; rightAssociative?: boolean }
-> = {
+type BinaryOperator = {
+  precedence: number;
+  opcode: Opcode;
+  rightAssociative?: boolean;
+};
+
+const BINARY_OPERATORS: Record<string, BinaryOperator> = {
   "+": { precedence: 1, opcode: OPCODES.ADD },
   "-": { precedence: 1, opcode: OPCODES.SUB },
   "*": { precedence: 2, opcode: OPCODES.MUL },
@@ -36,6 +41,7 @@ class LuauSubsetCompiler {
   private constantIndexes = new Map<string, number>();
 
   private locals = new Map<string, number>();
+
   private nextRegister = 0;
   private returned = false;
 
@@ -107,10 +113,12 @@ class LuauSubsetCompiler {
       );
     }
 
-    this.consume("=", "Expected '=' after local variable name.");
+    this.consume(
+      "=",
+      "Expected '=' after local variable name."
+    );
 
     const expression = this.parseExpression();
-
     const destination = this.allocateRegister();
 
     this.emit(
@@ -144,11 +152,15 @@ class LuauSubsetCompiler {
     }
 
     if (!this.isAtEnd()) {
-      throw this.error("Only one final return statement is supported.");
+      throw this.error(
+        "Only one final return statement is supported."
+      );
     }
   }
 
-  private parseExpression(minPrecedence = 0): ExpressionResult {
+  private parseExpression(
+    minPrecedence = 0
+  ): ExpressionResult {
     let left = this.parseUnary();
 
     while (!this.isAtEnd()) {
@@ -160,7 +172,10 @@ class LuauSubsetCompiler {
 
       const operator = BINARY_OPERATORS[token.value];
 
-      if (!operator || operator.precedence < minPrecedence) {
+      if (
+        !operator ||
+        operator.precedence < minPrecedence
+      ) {
         break;
       }
 
@@ -225,7 +240,6 @@ class LuauSubsetCompiler {
     if (token.type === "number") {
       this.advance();
 
-      // Initial compiler supports decimal numeric literals.
       if (
         !/^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(
           token.value
@@ -281,7 +295,9 @@ class LuauSubsetCompiler {
     );
   }
 
-  private loadConstant(value: VMConstant): ExpressionResult {
+  private loadConstant(
+    value: VMConstant
+  ): ExpressionResult {
     const constantIndex = this.addConstant(value);
     const destination = this.allocateRegister();
 
@@ -312,7 +328,9 @@ class LuauSubsetCompiler {
   }
 
   private constantKey(value: VMConstant): string {
-    if (value === null) return "null";
+    if (value === null) {
+      return "null";
+    }
 
     if (typeof value === "number") {
       return `number:${Object.is(value, -0) ? "-0" : value}`;
@@ -330,15 +348,22 @@ class LuauSubsetCompiler {
   }
 
   private emit(
-    op: number,
+    op: Opcode,
     a: number,
     b: number,
     c: number
   ): void {
-    this.instructions.push({ op, a, b, c });
+    this.instructions.push({
+      op,
+      a,
+      b,
+      c,
+    });
   }
 
-  private consumeIdentifier(message: string): LuauToken {
+  private consumeIdentifier(
+    message: string
+  ): LuauToken {
     const token = this.peek();
 
     if (!token || token.type !== "identifier") {
@@ -348,7 +373,10 @@ class LuauSubsetCompiler {
     return this.advance();
   }
 
-  private consume(value: string, message: string): LuauToken {
+  private consume(
+    value: string,
+    message: string
+  ): LuauToken {
     if (this.check(value)) {
       return this.advance();
     }
@@ -357,7 +385,9 @@ class LuauSubsetCompiler {
   }
 
   private match(value: string): boolean {
-    if (!this.check(value)) return false;
+    if (!this.check(value)) {
+      return false;
+    }
 
     this.advance();
     return true;
@@ -413,12 +443,17 @@ class LuauSubsetCompiler {
   }
 }
 
-export function compileLuauToVM(source: string): VMProgram {
+export function compileLuauToVM(
+  source: string
+): VMProgram {
   if (typeof source !== "string") {
     throw new Error("Source must be a string.");
   }
 
-  if (source.length === 0 || source.length > 100000) {
+  if (
+    source.length === 0 ||
+    source.length > 100000
+  ) {
     throw new Error("Source length is invalid.");
   }
 
