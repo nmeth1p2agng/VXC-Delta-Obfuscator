@@ -1,41 +1,24 @@
 
 /**
- * VXC Register-based Virtual Machine
- * Stage 5C
+ * VXC Register VM
+ * Stage 5E - Dispatcher Integration
  *
- * Executes a controlled subset of VXC bytecode.
- *
- * Operand format:
- *
- * LOADK       a = destination register, b = constant index
- * MOVE        a = destination register, b = source register
- *
- * ADD/SUB/... a = destination, b = left register, c = right register
- * NEG         a = destination, b = source register
- * NOT         a = destination, b = source register
- *
- * EQ/LT/LE    a = destination, b = left register, c = right register
- *
- * JMP         a = absolute instruction index
- * JMPIF       a = condition register, b = target instruction
- * JMPIFNOT    a = condition register, b = target instruction
- *
- * GETGLOBAL  a = destination register, b = string constant index
- * SETGLOBAL  a = string constant index, b = source register
- *
- * CONCAT      a = destination, b = left register, c = right register
- * LEN         a = destination, b = source register
- *
- * RETURN      a = return-value register
- * HALT        stops execution
+ * Executes validated VXC bytecode through the
+ * centralized instruction dispatcher.
  */
 
 import {
   OPCODES,
-  validateVMProgram,
   type VMProgram,
   type VMInstruction
 } from "./instruction-set";
+
+import {
+  createInstructionDispatcher,
+  validateDispatchProgram,
+  type DispatchContext,
+  type OpcodeHandlers
+} from "./instruction-dispatcher";
 
 export interface RegisterVMOptions {
   maxSteps?: number;
@@ -49,100 +32,118 @@ export interface RegisterVMResult {
   registers: unknown[];
 }
 
+interface VMExecutionContext extends DispatchContext {
+  program: VMProgram;
+  registers: unknown[];
+  globals: Record<string, unknown>;
+  nextPC: number;
+  returnValue: unknown;
+  halted: boolean;
+}
+
 const DEFAULT_MAX_STEPS = 100000;
 const MAX_ALLOWED_STEPS = 1000000;
 
 function isTruthy(value: unknown): boolean {
-  // Luau treats only false and nil as false.
-  return value !== false && value !== undefined &&
+  // Luau: only false and nil are false.
+  return value !== false &&
+    value !== undefined &&
     value !== null;
 }
 
-function requireNumber(
-  value: unknown,
-  instructionIndex: number
+function readRegister(
+  context: VMExecutionContext,
+  index: number
+): unknown {
+  if (
+    !Number.isInteger(index) ||
+    index < 0 ||
+    index >= context.registers.length
+  ) {
+    throw new Error(
+      `VXC VM: invalid register ${index} at instruction ${context.pc}.`
+    );
+  }
+
+  return context.registers[index];
+}
+
+function writeRegister(
+  context: VMExecutionContext,
+  index: number,
+  value: unknown
+): void {
+  if (
+    !Number.isInteger(index) ||
+    index < 0 ||
+    index >= context.registers.length
+  ) {
+    throw new Error(
+      `VXC VM: invalid destination register ${index} at instruction ${context.pc}.`
+    );
+  }
+
+  context.registers[index] = value;
+}
+
+function readNumber(
+  context: VMExecutionContext,
+  index: number
 ): number {
+  const value = readRegister(context, index);
+
   if (typeof value !== "number") {
     throw new Error(
-      `VXC VM: expected number at instruction ${instructionIndex}.`
+      `VXC VM: expected number in register ${index} at instruction ${context.pc}.`
     );
   }
 
   return value;
 }
 
-function requireStringConstant(
-  program: VMProgram,
-  index: number,
-  instructionIndex: number
+function readStringConstant(
+  context: VMExecutionContext,
+  index: number
 ): string {
   if (
     !Number.isInteger(index) ||
     index < 0 ||
-    index >= program.constants.length
+    index >= context.program.constants.length
   ) {
     throw new Error(
-      `VXC VM: invalid constant index at instruction ${instructionIndex}.`
+      `VXC VM: invalid constant index at instruction ${context.pc}.`
     );
   }
 
-  const value = program.constants[index];
+  const value = context.program.constants[index];
 
   if (typeof value !== "string") {
     throw new Error(
-      `VXC VM: expected string constant at instruction ${instructionIndex}.`
+      `VXC VM: expected string constant at instruction ${context.pc}.`
     );
   }
 
   return value;
 }
 
-function requireRegister(
-  registers: unknown[],
-  index: number,
-  instructionIndex: number
-): number {
-  if (
-    !Number.isInteger(index) ||
-    index < 0 ||
-    index >= registers.length
-  ) {
-    throw new Error(
-      `VXC VM: invalid register at instruction ${instructionIndex}.`
-    );
-  }
-
-  return index;
-}
-
-function requireTarget(
-  target: number,
-  instructionCount: number,
-  instructionIndex: number
-): number {
-  if (
-    !Number.isInteger(target) ||
-    target < 0 ||
-    target >= instructionCount
-  ) {
-    throw new Error(
-      `VXC VM: invalid jump target at instruction ${instructionIndex}.`
-    );
-  }
-
-  return target;
+function isRestrictedGlobal(name: string): boolean {
+  return (
+    name === "__proto__" ||
+    name === "prototype" ||
+    name === "constructor"
+  );
 }
 
 function compareValues(
   left: unknown,
   right: unknown,
-  instructionIndex: number
+  pc: number
 ): number {
   if (
     typeof left === "number" &&
     typeof right === "number"
   ) {
-    return left - right;
+    return left < right ? -1 : left > right ? 1 : 0;
   }
 
   if (
@@ -153,14 +154,14 @@ function compareValues(
   }
 
   throw new Error(
-    `VXC VM: values cannot be ordered at instruction ${instructionIndex}.`
+    `VXC VM: incompatible comparison at instruction ${pc}.`
   );
 }
 
 function concatenate(
   left: unknown,
   right: unknown,
-  instructionIndex: number
+  pc: number
 ): string {
   const valid = (value: unknown) =>
     typeof value === "string" ||
@@ -168,7 +169,7 @@ function concatenate(
 
   if (!valid(left) || !valid(right)) {
     throw new Error(
-      `VXC VM: invalid CONCAT operands at instruction ${instructionIndex}.`
+      `VXC VM: invalid CONCAT operands at instruction ${pc}.`
     );
   }
 
@@ -176,24 +177,231 @@ function concatenate(
 }
 
 /**
- * Execute a VXC VM program.
- *
- * This runtime deliberately supports only a subset
- * of the declared opcodes. Unsupported instructions
- * fail explicitly instead of silently producing wrong output.
+ * Build the opcode handler registry.
+ */
+function createHandlers(): OpcodeHandlers<VMExecutionContext> {
+  return {
+    [OPCODES.NOP]: () => {},
+
+    [OPCODES.LOADK]: (instruction, context) => {
+      writeRegister(
+        context,
+        instruction.a,
+        context.program.constants[instruction.b]
+      );
+    },
+
+    [OPCODES.MOVE]: (instruction, context) => {
+      writeRegister(
+        context,
+        instruction.a,
+        readRegister(context, instruction.b)
+      );
+    },
+
+    [OPCODES.ADD]: (instruction, context) => {
+      writeRegister(
+        context,
+        instruction.a,
+        readNumber(context, instruction.b) +
+          readNumber(context, instruction.c)
+      );
+    },
+
+    [OPCODES.SUB]: (instruction, context) => {
+      writeRegister(
+        context,
+        instruction.a,
+        readNumber(context, instruction.b) -
+          readNumber(context, instruction.c)
+      );
+    },
+
+    [OPCODES.MUL]: (instruction, context) => {
+      writeRegister(
+        context,
+        instruction.a,
+        readNumber(context, instruction.b) *
+          readNumber(context, instruction.c)
+      );
+    },
+
+    [OPCODES.DIV]: (instruction, context) => {
+      writeRegister(
+        context,
+        instruction.a,
+        readNumber(context, instruction.b) /
+          readNumber(context, instruction.c)
+      );
+    },
+
+    [OPCODES.MOD]: (instruction, context) => {
+      const left = readNumber(context, instruction.b);
+      const right = readNumber(context, instruction.c);
+
+      writeRegister(
+        context,
+        instruction.a,
+        left - Math.floor(left / right) * right
+      );
+    },
+
+    [OPCODES.POW]: (instruction, context) => {
+      writeRegister(
+        context,
+        instruction.a,
+        Math.pow(
+          readNumber(context, instruction.b),
+          readNumber(context, instruction.c)
+        )
+      );
+    },
+
+    [OPCODES.NEG]: (instruction, context) => {
+      writeRegister(
+        context,
+        instruction.a,
+        -readNumber(context, instruction.b)
+      );
+    },
+
+    [OPCODES.EQ]: (instruction, context) => {
+      writeRegister(
+        context,
+        instruction.a,
+        readRegister(context, instruction.b) ===
+          readRegister(context, instruction.c)
+      );
+    },
+
+    [OPCODES.LT]: (instruction, context) => {
+      writeRegister(
+        context,
+        instruction.a,
+        compareValues(
+          readRegister(context, instruction.b),
+          readRegister(context, instruction.c),
+          context.pc
+        ) < 0
+      );
+    },
+
+    [OPCODES.LE]: (instruction, context) => {
+      writeRegister(
+        context,
+        instruction.a,
+        compareValues(
+          readRegister(context, instruction.b),
+          readRegister(context, instruction.c),
+          context.pc
+        ) <= 0
+      );
+    },
+
+    [OPCODES.NOT]: (instruction, context) => {
+      writeRegister(
+        context,
+        instruction.a,
+        !isTruthy(readRegister(context, instruction.b))
+      );
+    },
+
+    [OPCODES.JMP]: (instruction, context) => {
+      context.nextPC = instruction.a;
+    },
+
+    [OPCODES.JMPIF]: (instruction, context) => {
+      if (isTruthy(readRegister(context, instruction.a))) {
+        context.nextPC = instruction.b;
+      }
+    },
+
+    [OPCODES.JMPIFNOT]: (instruction, context) => {
+      if (!isTruthy(readRegister(context, instruction.a))) {
+        context.nextPC = instruction.b;
+      }
+    },
+
+    [OPCODES.GETGLOBAL]: (instruction, context) => {
+      const name = readStringConstant(context, instruction.b);
+
+      if (isRestrictedGlobal(name)) {
+        throw new Error(
+          `VXC VM: restricted global name at instruction ${context.pc}.`
+        );
+      }
+
+      const value = Object.prototype.hasOwnProperty.call(
+        context.globals,
+        name
+      )
+        ? context.globals[name]
+        : undefined;
+
+      writeRegister(context, instruction.a, value);
+    },
+
+    [OPCODES.SETGLOBAL]: (instruction, context) => {
+      const name = readStringConstant(context, instruction.a);
+
+      if (isRestrictedGlobal(name)) {
+        throw new Error(
+          `VXC VM: restricted global name at instruction ${context.pc}.`
+        );
+      }
+
+      context.globals[name] = readRegister(
+        context,
+        instruction.b
+      );
+    },
+
+    [OPCODES.CONCAT]: (instruction, context) => {
+      writeRegister(
+        context,
+        instruction.a,
+        concatenate(
+          readRegister(context, instruction.b),
+          readRegister(context, instruction.c),
+          context.pc
+        )
+      );
+    },
+
+    [OPCODES.LEN]: (instruction, context) => {
+      const value = readRegister(context, instruction.b);
+
+      if (typeof value !== "string") {
+        throw new Error(
+          `VXC VM: LEN currently supports strings only at instruction ${context.pc}.`
+        );
+      }
+
+      writeRegister(context, instruction.a, value.length);
+    },
+
+    [OPCODES.RETURN]: (instruction, context) => {
+      context.returnValue = readRegister(
+        context,
+        instruction.a
+      );
+
+      context.halted = true;
+    },
+
+    [OPCODES.HALT]: (_instruction, context) => {
+      context.halted = true;
+    }
+  };
+}
+
+/**
+ * Execute a VXC VM program using the dispatcher.
  */
 export function executeRegisterVM(
   program: VMProgram,
   options: RegisterVMOptions = {}
 ): RegisterVMResult {
-  const validationErrors = validateVMProgram(program);
-
-  if (validationErrors.length > 0) {
-    throw new Error(
-      `VXC VM: ${validationErrors.join(" ")}`
-    );
-  }
-
   const maxSteps = options.maxSteps ?? DEFAULT_MAX_STEPS;
 
   if (
@@ -202,6 +410,23 @@ export function executeRegisterVM(
     maxSteps > MAX_ALLOWED_STEPS
   ) {
     throw new Error("VXC VM: invalid execution step limit.");
+  }
+
+  const dispatcher = createInstructionDispatcher(
+    createHandlers(),
+    { maxInstructions: maxSteps }
+  );
+
+  const validationErrors = validateDispatchProgram(
+    program,
+    dispatcher,
+    { maxInstructions: maxSteps }
+  );
+
+  if (validationErrors.length > 0) {
+    throw new Error(
+      `VXC VM validation failed: ${validationErrors.join(" ")}`
+    );
   }
 
   const globals = options.globals ?? Object.create(null);
@@ -214,279 +439,42 @@ export function executeRegisterVM(
     throw new Error("VXC VM: globals must be an object.");
   }
 
-  const registers: unknown[] =
-    new Array(program.registerCount).fill(undefined);
-
-  let pc = 0;
-  let steps = 0;
-  let returnValue: unknown = undefined;
-  let halted = false;
-
-  const read = (
-    index: number,
-    instructionIndex: number
-  ): unknown => {
-    return registers[
-      requireRegister(registers, index, instructionIndex)
-    ];
+  const context: VMExecutionContext = {
+    pc: 0,
+    steps: 0,
+    program,
+    registers: new Array(program.registerCount).fill(undefined),
+    globals,
+    nextPC: 0,
+    returnValue: undefined,
+    halted: false
   };
 
-  const write = (
-    index: number,
-    value: unknown,
-    instructionIndex: number
-  ): void => {
-    registers[
-      requireRegister(registers, index, instructionIndex)
-    ] = value;
-  };
-
-  while (pc < program.instructions.length) {
-    if (steps >= maxSteps) {
+  while (
+    context.pc < program.instructions.length &&
+    !context.halted
+  ) {
+    if (context.steps >= maxSteps) {
       throw new Error(
         `VXC VM: execution step limit (${maxSteps}) exceeded.`
       );
     }
 
-    const currentPC = pc;
     const instruction: VMInstruction =
-      program.instructions[currentPC];
+      program.instructions[context.pc];
 
-    steps++;
-    pc++;
+    context.nextPC = context.pc + 1;
 
-    const a = instruction.a;
-    const b = instruction.b;
-    const c = instruction.c;
+    dispatcher.dispatch(instruction, context);
 
-    switch (instruction.op) {
-      case OPCODES.NOP:
-        break;
-
-      case OPCODES.LOADK: {
-        if (
-          !Number.isInteger(b) ||
-          b < 0 ||
-          b >= program.constants.length
-        ) {
-          throw new Error(
-            `VXC VM: invalid LOADK constant at instruction ${currentPC}.`
-          );
-        }
-
-        write(a, program.constants[b], currentPC);
-        break;
-      }
-
-      case OPCODES.MOVE:
-        write(a, read(b, currentPC), currentPC);
-        break;
-
-      case OPCODES.ADD: {
-        const left = requireNumber(read(b, currentPC), currentPC);
-        const right = requireNumber(read(c, currentPC), currentPC);
-        write(a, left + right, currentPC);
-        break;
-      }
-
-      case OPCODES.SUB: {
-        const left = requireNumber(read(b, currentPC), currentPC);
-        const right = requireNumber(read(c, currentPC), currentPC);
-        write(a, left - right, currentPC);
-        break;
-      }
-
-      case OPCODES.MUL: {
-        const left = requireNumber(read(b, currentPC), currentPC);
-        const right = requireNumber(read(c, currentPC), currentPC);
-        write(a, left * right, currentPC);
-        break;
-      }
-
-      case OPCODES.DIV: {
-        const left = requireNumber(read(b, currentPC), currentPC);
-        const right = requireNumber(read(c, currentPC), currentPC);
-        write(a, left / right, currentPC);
-        break;
-      }
-
-      case OPCODES.MOD: {
-        const left = requireNumber(read(b, currentPC), currentPC);
-        const right = requireNumber(read(c, currentPC), currentPC);
-        write(
-          a,
-          left - Math.floor(left / right) * right,
-          currentPC
-        );
-        break;
-      }
-
-      case OPCODES.POW: {
-        const left = requireNumber(read(b, currentPC), currentPC);
-        const right = requireNumber(read(c, currentPC), currentPC);
-        write(a, Math.pow(left, right), currentPC);
-        break;
-      }
-
-      case OPCODES.NEG: {
-        const value = requireNumber(read(b, currentPC), currentPC);
-        write(a, -value, currentPC);
-        break;
-      }
-
-      case OPCODES.EQ:
-        write(
-          a,
-          read(b, currentPC) === read(c, currentPC),
-          currentPC
-        );
-        break;
-
-      case OPCODES.LT:
-        write(
-          a,
-          compareValues(
-            read(b, currentPC),
-            read(c, currentPC),
-            currentPC
-          ) < 0,
-          currentPC
-        );
-        break;
-
-      case OPCODES.LE:
-        write(
-          a,
-          compareValues(
-            read(b, currentPC),
-            read(c, currentPC),
-            currentPC
-          ) <= 0,
-          currentPC
-        );
-        break;
-
-      case OPCODES.NOT:
-        write(a, !isTruthy(read(b, currentPC)), currentPC);
-        break;
-
-      case OPCODES.JMP:
-        pc = requireTarget(
-          a,
-          program.instructions.length,
-          currentPC
-        );
-        break;
-
-      case OPCODES.JMPIF:
-        if (isTruthy(read(a, currentPC))) {
-          pc = requireTarget(
-            b,
-            program.instructions.length,
-            currentPC
-          );
-        }
-        break;
-
-      case OPCODES.JMPIFNOT:
-        if (!isTruthy(read(a, currentPC))) {
-          pc = requireTarget(
-            b,
-            program.instructions.length,
-            currentPC
-          );
-        }
-        break;
-
-      case OPCODES.GETGLOBAL: {
-        const name = requireStringConstant(
-          program,
-          b,
-          currentPC
-        );
-
-        write(a, globals[name], currentPC);
-        break;
-      }
-
-      case OPCODES.SETGLOBAL: {
-        const name = requireStringConstant(
-          program,
-          a,
-          currentPC
-        );
-
-        if (
-          name === "__proto__" ||
-          name === "prototype" ||
-          name === "constructor"
-        ) {
-          throw new Error(
-            `VXC VM: restricted global name at instruction ${currentPC}.`
-          );
-        }
-
-        globals[name] = read(b, currentPC);
-        break;
-      }
-
-      case OPCODES.CONCAT:
-        write(
-          a,
-          concatenate(
-            read(b, currentPC),
-            read(c, currentPC),
-            currentPC
-          ),
-          currentPC
-        );
-        break;
-
-      case OPCODES.LEN: {
-        const value = read(b, currentPC);
-
-        if (typeof value !== "string") {
-          throw new Error(
-            `VXC VM: LEN currently supports strings only at instruction ${currentPC}.`
-          );
-        }
-
-        write(a, value.length, currentPC);
-        break;
-      }
-
-      case OPCODES.RETURN:
-        returnValue = read(a, currentPC);
-        halted = true;
-
-        return {
-          value: returnValue,
-          steps,
-          halted,
-          registers: [...registers]
-        };
-
-      case OPCODES.HALT:
-        halted = true;
-
-        return {
-          value: undefined,
-          steps,
-          halted,
-          registers: [...registers]
-        };
-
-      default:
-        throw new Error(
-          `VXC VM: unsupported opcode ${instruction.op} at instruction ${currentPC}.`
-        );
-    }
+    context.steps++;
+    context.pc = context.nextPC;
   }
 
   return {
-    value: returnValue,
-    steps,
-    halted,
-    registers: [...registers]
+    value: context.returnValue,
+    steps: context.steps,
+    halted: context.halted,
+    registers: [...context.registers]
   };
 }
