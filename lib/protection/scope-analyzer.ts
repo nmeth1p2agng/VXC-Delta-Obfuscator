@@ -1,82 +1,50 @@
 
 import { tokenizeLuau } from "../tokenizer";
 
-export interface ScopeDeclaration {
+export interface IdentifierEdit {
   name: string;
-  tokenIndex: number;
   start: number;
   end: number;
-  scopeId: number;
-  kind: "local" | "parameter" | "loop";
-  references: number[];
 }
 
-export interface ScopeAnalysisResult {
-  declarations: ScopeDeclaration[];
+export interface IdentifierAnalysis {
+  edits: IdentifierEdit[];
   warnings: string[];
-  safe: boolean;
+  supported: boolean;
 }
 
-interface Token {
-  type: string;
-  value: string;
-  start: number;
-  end: number;
-}
-
-interface Scope {
-  id: number;
-  parent: number | null;
-  declarations: Map<string, ScopeDeclaration>;
-}
-
-const BLOCK_OPENERS = new Set([
+const COMPLEX_KEYWORDS = new Set([
   "function",
   "if",
-  "do",
-  "while",
-  "for",
-  "repeat",
-]);
-
-const BLOCK_CLOSERS = new Set([
+  "then",
+  "else",
+  "elseif",
   "end",
+  "for",
+  "while",
+  "repeat",
   "until",
-]);
-
-const CONTROL_KEYWORDS = new Set([
-  "and", "break", "continue", "do", "else", "elseif",
-  "end", "false", "for", "function", "if", "in",
-  "local", "nil", "not", "or", "repeat", "return",
-  "then", "true", "until", "while",
-]);
-
-const UNSUPPORTED_KEYWORDS = new Set([
+  "do",
+  "continue",
+  "break",
   "export",
   "type",
   "declare",
 ]);
 
-function isIdentifier(token?: Token): boolean {
+function isIdentifier(token: any): boolean {
   return token?.type === "identifier";
 }
 
-function isSymbol(token: Token | undefined, value: string): boolean {
-  return token?.value === value;
-}
-
-function isKeyword(token: Token | undefined, value: string): boolean {
+function isKeyword(token: any, value: string): boolean {
   return token?.type === "keyword" && token.value === value;
 }
 
-function isPropertyName(
-  tokens: Token[],
-  index: number,
-): boolean {
+function isPropertyOrTableKey(tokens: any[], index: number): boolean {
   const previous = tokens[index - 1];
   const next = tokens[index + 1];
 
-  // object.name
+  // object.name atau object:name
   if (
     previous &&
     (previous.value === "." || previous.value === ":")
@@ -84,7 +52,7 @@ function isPropertyName(
     return true;
   }
 
-  // { name = value }
+  // { name = value } atau { name = value, ... }
   if (
     next?.value === "=" &&
     previous &&
@@ -96,355 +64,171 @@ function isPropertyName(
   return false;
 }
 
-function createScope(
-  id: number,
-  parent: number | null,
-): Scope {
-  return {
-    id,
-    parent,
-    declarations: new Map(),
-  };
-}
-
-export function analyzeScopes(
+export function analyzeIdentifiers(
   source: string,
-): ScopeAnalysisResult {
-  const tokens = tokenizeLuau(source) as Token[];
+): IdentifierAnalysis {
+  const tokens = tokenizeLuau(source);
 
   const warnings: string[] = [];
-  const declarations: ScopeDeclaration[] = [];
+  const edits: IdentifierEdit[] = [];
 
-  const scopes: Scope[] = [
-    createScope(0, null),
-  ];
-
-  let currentScope = 0;
-  let nextScopeId = 1;
-
-  const scopeStack: number[] = [0];
+  const declarations = new Map<
+    string,
+    { index: number; start: number; end: number }
+  >();
 
   const declarationIndexes = new Set<number>();
-  const ignoredIndexes = new Set<number>();
 
-  function getCurrentScope(): Scope {
-    return scopes[currentScope];
-  }
-
-  function pushScope(): void {
-    const scope = createScope(
-      nextScopeId++,
-      currentScope,
-    );
-
-    scopes.push(scope);
-    currentScope = scope.id;
-    scopeStack.push(scope.id);
-  }
-
-  function popScope(): void {
-    if (scopeStack.length <= 1) {
-      warnings.push("Unexpected block terminator.");
-      return;
-    }
-
-    scopeStack.pop();
-    currentScope = scopeStack[scopeStack.length - 1];
-  }
-
-  function findDeclaration(
-    name: string,
-    scopeId: number,
-  ): ScopeDeclaration | undefined {
-    let scope = scopes[scopeId];
-
-    while (scope) {
-      const declaration = scope.declarations.get(name);
-
-      if (declaration) {
-        return declaration;
-      }
-
-      if (scope.parent === null) {
-        break;
-      }
-
-      scope = scopes[scope.parent];
-    }
-
-    return undefined;
-  }
-
-  function addDeclaration(
-    index: number,
-    kind: ScopeDeclaration["kind"],
-  ): void {
-    const token = tokens[index];
-
-    if (!isIdentifier(token)) {
-      warnings.push(
-        `Invalid ${kind} declaration near token ${index}.`,
-      );
-      return;
-    }
-
-    const scope = getCurrentScope();
-
-    if (scope.declarations.has(token.value)) {
-      warnings.push(
-        `Duplicate local declaration: ${token.value}.`,
-      );
-      return;
-    }
-
-    const declaration: ScopeDeclaration = {
-      name: token.value,
-      tokenIndex: index,
-      start: token.start,
-      end: token.end,
-      scopeId: currentScope,
-      kind,
-      references: [],
-    };
-
-    scope.declarations.set(token.value, declaration);
-    declarations.push(declaration);
-    declarationIndexes.add(index);
-  }
-
-  function findMatching(
-    start: number,
-    open: string,
-    close: string,
-  ): number {
-    let depth = 0;
-
-    for (let i = start; i < tokens.length; i++) {
-      if (tokens[i].value === open) {
-        depth++;
-      } else if (tokens[i].value === close) {
-        depth--;
-
-        if (depth === 0) {
-          return i;
-        }
-      }
-    }
-
-    return -1;
-  }
-
-  // Pass 1: identify unsupported syntax.
+  // Hindari transformasi jika struktur scope belum didukung.
   for (const token of tokens) {
     if (
       token.type === "keyword" &&
-      UNSUPPORTED_KEYWORDS.has(token.value)
+      COMPLEX_KEYWORDS.has(token.value)
     ) {
-      warnings.push(
-        `Unsupported Luau syntax: ${token.value}.`,
-      );
+      return {
+        edits: [],
+        warnings: [
+          `Identifier protection skipped: unsupported scope syntax "${token.value}".`,
+        ],
+        supported: false,
+      };
     }
   }
 
-  if (warnings.length > 0) {
-    return {
-      declarations: [],
-      warnings,
-      safe: false,
-    };
-  }
-
-  // Pass 2: identify local declarations and block scopes.
+  // Cari deklarasi local sederhana.
   for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i];
-    const next = tokens[i + 1];
-
-    // local function name(...)
-    if (
-      isKeyword(token, "local") &&
-      isKeyword(next, "function")
-    ) {
-      if (!isIdentifier(tokens[i + 2])) {
-        warnings.push("Invalid local function declaration.");
-        break;
-      }
-
-      addDeclaration(i + 2, "local");
-      ignoredIndexes.add(i + 2);
-
-      // Function body starts after its parameter list.
-      let open = i + 3;
-
-      while (open < tokens.length && tokens[open].value !== "(") {
-        open++;
-      }
-
-      if (open >= tokens.length) {
-        warnings.push("Missing function parameter list.");
-        break;
-      }
-
-      const close = findMatching(open, "(", ")");
-
-      if (close === -1) {
-        warnings.push("Unclosed function parameter list.");
-        break;
-      }
-
-      pushScope();
-
-      for (let p = open + 1; p < close; p++) {
-        if (isIdentifier(tokens[p])) {
-          const previous = tokens[p - 1];
-
-          if (
-            p === open + 1 ||
-            previous?.value === ","
-          ) {
-            addDeclaration(p, "parameter");
-          }
-        }
-      }
-
+    if (!isKeyword(tokens[i], "local")) {
       continue;
     }
 
-    // function name(...) or function(...)
-    if (isKeyword(token, "function")) {
-      let open = i + 1;
+    let index = i + 1;
+    const localIndexes: number[] = [];
 
-      while (open < tokens.length && tokens[open].value !== "(") {
-        open++;
-      }
-
-      if (open >= tokens.length) {
-        warnings.push("Missing function parameter list.");
+    while (index < tokens.length) {
+      if (!isIdentifier(tokens[index])) {
         break;
       }
 
-      const close = findMatching(open, "(", ")");
+      localIndexes.push(index);
+      index++;
 
-      if (close === -1) {
-        warnings.push("Unclosed function parameter list.");
+      if (tokens[index]?.value !== ",") {
         break;
       }
 
-      pushScope();
+      index++;
+    }
 
-      for (let p = open + 1; p < close; p++) {
-        if (
-          isIdentifier(tokens[p]) &&
-          (p === open + 1 || tokens[p - 1].value === ",")
-        ) {
-          addDeclaration(p, "parameter");
-        }
-      }
-
+    if (localIndexes.length === 0) {
       continue;
     }
 
-    // local a, b, c
-    if (isKeyword(token, "local")) {
-      let p = i + 1;
-
-      while (p < tokens.length) {
-        if (!isIdentifier(tokens[p])) {
-          break;
-        }
-
-        addDeclaration(p, "local");
-        p++;
-
-        if (tokens[p]?.value !== ",") {
-          break;
-        }
-
-        p++;
-      }
-
-      continue;
+    // Hanya mendukung deklarasi local dengan assignment sederhana.
+    if (tokens[index]?.value !== "=") {
+      return {
+        edits: [],
+        warnings: [
+          "Identifier protection skipped: unsupported local declaration.",
+        ],
+        supported: false,
+      };
     }
 
-    // for i = ... or for k, v in ...
-    if (isKeyword(token, "for")) {
-      let p = i + 1;
-      const loopNames: number[] = [];
+    for (const declarationIndex of localIndexes) {
+      const token = tokens[declarationIndex];
+      const name = token.value;
 
-      while (p < tokens.length && isIdentifier(tokens[p])) {
-        loopNames.push(p);
-        p++;
-
-        if (tokens[p]?.value !== ",") {
-          break;
-        }
-
-        p++;
+      if (declarations.has(name)) {
+        return {
+          edits: [],
+          warnings: [
+            `Identifier protection skipped: duplicate local "${name}".`,
+          ],
+          supported: false,
+        };
       }
 
-      if (loopNames.length > 0) {
-        pushScope();
+      declarations.set(name, {
+        index: declarationIndex,
+        start: token.start,
+        end: token.end,
+      });
 
-        for (const index of loopNames) {
-          addDeclaration(index, "loop");
-        }
-      }
-
-      continue;
-    }
-
-    // Blocks
-    if (
-      BLOCK_OPENERS.has(token.value) &&
-      token.value !== "function" &&
-      token.value !== "for"
-    ) {
-      pushScope();
-      continue;
-    }
-
-    if (BLOCK_CLOSERS.has(token.value)) {
-      popScope();
+      declarationIndexes.add(declarationIndex);
     }
   }
 
-  if (warnings.length > 0) {
+  if (declarations.size === 0) {
     return {
-      declarations: [],
+      edits: [],
       warnings,
-      safe: false,
+      supported: true,
     };
   }
 
-  // Pass 3: resolve identifier references.
+  // Cek referensi sebelum deklarasi.
+  for (const [name, declaration] of declarations) {
+    for (let i = 0; i < declaration.index; i++) {
+      const token = tokens[i];
+
+      if (
+        isIdentifier(token) &&
+        token.value === name &&
+        !isPropertyOrTableKey(tokens, i)
+      ) {
+        return {
+          edits: [],
+          warnings: [
+            `Identifier protection skipped: "${name}" is referenced before declaration.`,
+          ],
+          supported: false,
+        };
+      }
+    }
+  }
+
+  // Tambahkan edit untuk nama deklarasi.
+  for (const [name, declaration] of declarations) {
+    edits.push({
+      name,
+      start: declaration.start,
+      end: declaration.end,
+    });
+  }
+
+  // Cari semua referensi lokal.
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
 
     if (
       !isIdentifier(token) ||
       declarationIndexes.has(i) ||
-      ignoredIndexes.has(i) ||
-      isPropertyName(tokens, i)
+      isPropertyOrTableKey(tokens, i)
     ) {
       continue;
     }
 
-    if (CONTROL_KEYWORDS.has(token.value)) {
+    const declaration = declarations.get(token.value);
+
+    if (!declaration) {
       continue;
     }
 
-    const declaration = findDeclaration(
-      token.value,
-      currentScope,
-    );
-
-    if (declaration) {
-      declaration.references.push(i);
+    // Referensi hanya diproses setelah deklarasi.
+    if (i <= declaration.index) {
+      continue;
     }
+
+    edits.push({
+      name: token.value,
+      start: token.start,
+      end: token.end,
+    });
   }
 
   return {
-    declarations,
+    edits,
     warnings,
-    safe: true,
+    supported: true,
   };
 }
