@@ -1,6 +1,6 @@
 
 import { NextRequest, NextResponse } from "next/server";
-import { obfuscateLuau } from "../../../../lib/obfuscator";
+import { obfuscateLuau } from "../../../lib/obfuscator";
 
 export const runtime = "nodejs";
 
