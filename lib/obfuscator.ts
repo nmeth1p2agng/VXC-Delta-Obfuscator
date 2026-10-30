@@ -1,4 +1,3 @@
-
 import {
   checkCompatibility,
   CompatibilityTarget
@@ -9,6 +8,10 @@ import { validateLuau } from "./validator";
 import {
   protectIdentifiers
 } from "./protection/identifier-protection";
+
+import {
+  protectNumbers
+} from "./protection/number-protection";
 
 import {
   protectStrings
@@ -26,6 +29,8 @@ export interface ObfuscationResult {
   tokenCount: number;
   detectedGlobals: string[];
   renamedIdentifiers: number;
+  protectedNumbers: number;
+  skippedNumbers: number;
   protectedStrings: number;
   skippedStrings: number;
 }
@@ -36,6 +41,7 @@ export function obfuscateLuau(
   source: string,
   options: ObfuscationOptions = {}
 ): ObfuscationResult {
+
   const failure = (errors: string[]): ObfuscationResult => ({
     success: false,
     output: "",
@@ -44,6 +50,8 @@ export function obfuscateLuau(
     tokenCount: 0,
     detectedGlobals: [],
     renamedIdentifiers: 0,
+    protectedNumbers: 0,
+    skippedNumbers: 0,
     protectedStrings: 0,
     skippedStrings: 0
   });
@@ -67,14 +75,22 @@ export function obfuscateLuau(
 
   const target = options.target ?? "delta-android";
 
-  const compatibility = checkCompatibility(source, target);
+  const compatibility = checkCompatibility(
+    source,
+    target
+  );
 
-  // Stage 2
+  // Stage 2: Identifier Protection
   const identifierResult = protectIdentifiers(source);
 
-  // Stage 3
-  const stringResult = protectStrings(
+  // Stage 4: Number Protection
+  const numberResult = protectNumbers(
     identifierResult.output
+  );
+
+  // Stage 3: String Protection
+  const stringResult = protectStrings(
+    numberResult.output
   );
 
   return {
@@ -84,11 +100,14 @@ export function obfuscateLuau(
     warnings: [
       ...compatibility.warnings,
       ...identifierResult.warnings,
+      ...numberResult.warnings,
       ...stringResult.warnings
     ],
     tokenCount: compatibility.tokenCount,
     detectedGlobals: compatibility.detectedGlobals,
     renamedIdentifiers: identifierResult.renamed,
+    protectedNumbers: numberResult.protectedNumbers,
+    skippedNumbers: numberResult.skippedNumbers,
     protectedStrings: stringResult.protectedStrings,
     skippedStrings: stringResult.skippedStrings
   };
