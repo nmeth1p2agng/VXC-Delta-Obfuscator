@@ -1,4 +1,4 @@
-
+ 
 import { NextRequest, NextResponse } from "next/server";
 import { obfuscateLuau } from "../../../lib/obfuscator";
 
@@ -29,12 +29,9 @@ export async function POST(request: NextRequest) {
       target: "delta-android"
     });
 
-    return NextResponse.json(
-      result,
-      {
-        status: result.success ? 200 : 422
-      }
-    );
+    return NextResponse.json(result, {
+      status: result.success ? 200 : 422
+    });
   } catch {
     return NextResponse.json(
       {
