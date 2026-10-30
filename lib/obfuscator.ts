@@ -5,6 +5,10 @@ import {
 
 import { validateLuau } from "./validator";
 
+import {
+  protectIdentifiers
+} from "./protection/identifier-protection";
+
 export interface ObfuscationOptions {
   target?: CompatibilityTarget;
 }
@@ -16,6 +20,7 @@ export interface ObfuscationResult {
   warnings: string[];
   tokenCount: number;
   detectedGlobals: string[];
+  renamedIdentifiers: number;
 }
 
 const MAX_SOURCE_LENGTH = 100_000;
@@ -24,41 +29,37 @@ export function obfuscateLuau(
   source: string,
   options: ObfuscationOptions = {}
 ): ObfuscationResult {
-  if (typeof source !== "string" || source.trim().length === 0) {
-    return {
-      success: false,
-      output: "",
-      errors: ["Source code cannot be empty."],
-      warnings: [],
-      tokenCount: 0,
-      detectedGlobals: []
-    };
+  const target = options.target ?? "delta-android";
+
+  const failure = (
+    errors: string[]
+  ): ObfuscationResult => ({
+    success: false,
+    output: "",
+    errors,
+    warnings: [],
+    tokenCount: 0,
+    detectedGlobals: [],
+    renamedIdentifiers: 0
+  });
+
+  if (
+    typeof source !== "string" ||
+    source.trim().length === 0
+  ) {
+    return failure(["Source code cannot be empty."]);
   }
 
   if (source.length > MAX_SOURCE_LENGTH) {
-    return {
-      success: false,
-      output: "",
-      errors: ["Source code exceeds the maximum size."],
-      warnings: [],
-      tokenCount: 0,
-      detectedGlobals: []
-    };
+    return failure([
+      "Source code exceeds the maximum size."
+    ]);
   }
-
-  const target = options.target ?? "delta-android";
 
   const validation = validateLuau(source);
 
   if (!validation.valid) {
-    return {
-      success: false,
-      output: "",
-      errors: validation.errors,
-      warnings: [],
-      tokenCount: validation.tokenCount,
-      detectedGlobals: []
-    };
+    return failure(validation.errors);
   }
 
   const compatibility = checkCompatibility(
@@ -66,12 +67,18 @@ export function obfuscateLuau(
     target
   );
 
+  const protection = protectIdentifiers(source);
+
   return {
     success: true,
-    output: source,
+    output: protection.output,
     errors: [],
-    warnings: compatibility.warnings,
+    warnings: [
+      ...compatibility.warnings,
+      ...protection.warnings
+    ],
     tokenCount: compatibility.tokenCount,
-    detectedGlobals: compatibility.detectedGlobals
+    detectedGlobals: compatibility.detectedGlobals,
+    renamedIdentifiers: protection.renamed
   };
 }
