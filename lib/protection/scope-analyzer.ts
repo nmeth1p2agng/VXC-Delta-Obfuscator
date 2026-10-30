@@ -5,6 +5,7 @@ export interface IdentifierEdit {
   name: string;
   start: number;
   end: number;
+  replacement: string;
 }
 
 export interface IdentifierAnalysis {
@@ -40,11 +41,13 @@ function isKeyword(token: any, value: string): boolean {
   return token?.type === "keyword" && token.value === value;
 }
 
-function isPropertyOrTableKey(tokens: any[], index: number): boolean {
+function isPropertyOrTableKey(
+  tokens: any[],
+  index: number,
+): boolean {
   const previous = tokens[index - 1];
   const next = tokens[index + 1];
 
-  // object.name atau object:name
   if (
     previous &&
     (previous.value === "." || previous.value === ":")
@@ -52,7 +55,6 @@ function isPropertyOrTableKey(tokens: any[], index: number): boolean {
     return true;
   }
 
-  // { name = value } atau { name = value, ... }
   if (
     next?.value === "=" &&
     previous &&
@@ -79,7 +81,7 @@ export function analyzeIdentifiers(
 
   const declarationIndexes = new Set<number>();
 
-  // Hindari transformasi jika struktur scope belum didukung.
+  // Lewati sintaks kompleks yang belum didukung.
   for (const token of tokens) {
     if (
       token.type === "keyword" &&
@@ -95,7 +97,7 @@ export function analyzeIdentifiers(
     }
   }
 
-  // Cari deklarasi local sederhana.
+  // Analisis deklarasi local sederhana.
   for (let i = 0; i < tokens.length; i++) {
     if (!isKeyword(tokens[i], "local")) {
       continue;
@@ -123,7 +125,6 @@ export function analyzeIdentifiers(
       continue;
     }
 
-    // Hanya mendukung deklarasi local dengan assignment sederhana.
     if (tokens[index]?.value !== "=") {
       return {
         edits: [],
@@ -166,7 +167,7 @@ export function analyzeIdentifiers(
     };
   }
 
-  // Cek referensi sebelum deklarasi.
+  // Pastikan tidak ada referensi sebelum deklarasi.
   for (const [name, declaration] of declarations) {
     for (let i = 0; i < declaration.index; i++) {
       const token = tokens[i];
@@ -187,16 +188,17 @@ export function analyzeIdentifiers(
     }
   }
 
-  // Tambahkan edit untuk nama deklarasi.
+  // Tambahkan edit untuk deklarasi.
   for (const [name, declaration] of declarations) {
     edits.push({
       name,
       start: declaration.start,
       end: declaration.end,
+      replacement: "",
     });
   }
 
-  // Cari semua referensi lokal.
+  // Tambahkan edit untuk referensi.
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
 
@@ -210,12 +212,7 @@ export function analyzeIdentifiers(
 
     const declaration = declarations.get(token.value);
 
-    if (!declaration) {
-      continue;
-    }
-
-    // Referensi hanya diproses setelah deklarasi.
-    if (i <= declaration.index) {
+    if (!declaration || i <= declaration.index) {
       continue;
     }
 
@@ -223,6 +220,7 @@ export function analyzeIdentifiers(
       name: token.value,
       start: token.start,
       end: token.end,
+      replacement: "",
     });
   }
 
