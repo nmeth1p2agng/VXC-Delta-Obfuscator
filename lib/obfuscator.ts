@@ -1,3 +1,4 @@
+
 import {
   checkCompatibility,
   CompatibilityTarget
@@ -8,6 +9,10 @@ import { validateLuau } from "./validator";
 import {
   protectIdentifiers
 } from "./protection/identifier-protection";
+
+import {
+  protectStrings
+} from "./protection/string-protection";
 
 export interface ObfuscationOptions {
   target?: CompatibilityTarget;
@@ -21,6 +26,8 @@ export interface ObfuscationResult {
   tokenCount: number;
   detectedGlobals: string[];
   renamedIdentifiers: number;
+  protectedStrings: number;
+  skippedStrings: number;
 }
 
 const MAX_SOURCE_LENGTH = 100_000;
@@ -29,18 +36,16 @@ export function obfuscateLuau(
   source: string,
   options: ObfuscationOptions = {}
 ): ObfuscationResult {
-  const target = options.target ?? "delta-android";
-
-  const failure = (
-    errors: string[]
-  ): ObfuscationResult => ({
+  const failure = (errors: string[]): ObfuscationResult => ({
     success: false,
     output: "",
     errors,
     warnings: [],
     tokenCount: 0,
     detectedGlobals: [],
-    renamedIdentifiers: 0
+    renamedIdentifiers: 0,
+    protectedStrings: 0,
+    skippedStrings: 0
   });
 
   if (
@@ -51,9 +56,7 @@ export function obfuscateLuau(
   }
 
   if (source.length > MAX_SOURCE_LENGTH) {
-    return failure([
-      "Source code exceeds the maximum size."
-    ]);
+    return failure(["Source code exceeds maximum size."]);
   }
 
   const validation = validateLuau(source);
@@ -62,23 +65,31 @@ export function obfuscateLuau(
     return failure(validation.errors);
   }
 
-  const compatibility = checkCompatibility(
-    source,
-    target
-  );
+  const target = options.target ?? "delta-android";
 
-  const protection = protectIdentifiers(source);
+  const compatibility = checkCompatibility(source, target);
+
+  // Stage 2
+  const identifierResult = protectIdentifiers(source);
+
+  // Stage 3
+  const stringResult = protectStrings(
+    identifierResult.output
+  );
 
   return {
     success: true,
-    output: protection.output,
+    output: stringResult.output,
     errors: [],
     warnings: [
       ...compatibility.warnings,
-      ...protection.warnings
+      ...identifierResult.warnings,
+      ...stringResult.warnings
     ],
     tokenCount: compatibility.tokenCount,
     detectedGlobals: compatibility.detectedGlobals,
-    renamedIdentifiers: protection.renamed
+    renamedIdentifiers: identifierResult.renamed,
+    protectedStrings: stringResult.protectedStrings,
+    skippedStrings: stringResult.skippedStrings
   };
 }
