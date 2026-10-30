@@ -1,4 +1,4 @@
-
+import { decodeVMProgram } from "./bytecode-decoder";
 import { OPCODES, type VMProgram } from "./instruction-set";
 import { executeRegisterVM } from "./register-vm";
 
