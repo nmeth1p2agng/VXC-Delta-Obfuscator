@@ -17,18 +17,23 @@ export interface VMPipelineResult {
   warnings: string[];
 }
 
-const DEFAULT_MAX_STEPS = 100000;
+const DEFAULT_MAX_STEPS = 100_000;
+const MAX_SOURCE_LENGTH = 100_000;
 
 export function compileToLuauVM(
   source: string,
   options: VMPipelineOptions = {}
 ): VMPipelineResult {
   if (typeof source !== "string") {
-    throw new Error("VXC VM: source must be a string.");
+    throw new Error("Source must be a string.");
   }
 
-  if (source.length === 0 || source.length > 100000) {
-    throw new Error("VXC VM: invalid source length.");
+  if (source.trim().length === 0) {
+    throw new Error("Source code cannot be empty.");
+  }
+
+  if (source.length > MAX_SOURCE_LENGTH) {
+    throw new Error("Source code is too large.");
   }
 
   const maxSteps = options.maxSteps ?? DEFAULT_MAX_STEPS;
@@ -36,31 +41,21 @@ export function compileToLuauVM(
   if (
     !Number.isInteger(maxSteps) ||
     maxSteps < 1 ||
-    maxSteps > 1000000
+    maxSteps > 1_000_000
   ) {
-    throw new Error("VXC VM: invalid execution limit.");
+    throw new Error("Invalid VM execution step limit.");
   }
 
-  // Stage 1: Compile Luau into VM instructions.
   const program = compileLuauToVM(source);
 
-  // Stage 2: Encode VM instructions.
   const bytecode = encodeVMProgram(program);
 
-  // Stage 3: Decode and validate the encoded bytecode.
   const decodedProgram = decodeVMProgram(bytecode);
 
-  // Stage 4: Generate standalone Luau runtime.
-  const output = renderLuauVM(
-    decodedProgram,
-    maxSteps
-  );
+  const output = renderLuauVM(decodedProgram, maxSteps);
 
-  if (
-    typeof output !== "string" ||
-    output.length === 0
-  ) {
-    throw new Error("VXC VM: runtime generation failed.");
+  if (typeof output !== "string" || output.length === 0) {
+    throw new Error("VM output generation failed.");
   }
 
   return {
@@ -72,8 +67,8 @@ export function compileToLuauVM(
     registerCount: decodedProgram.registerCount,
     warnings: [
       "Only the supported Luau subset can be compiled.",
-      "Generated Luau runtime requires testing in the target executor.",
-      "The embedded instruction representation is not encrypted."
-    ]
+      "Generated VM output requires testing in the target executor.",
+      "The embedded instruction representation is not encrypted.",
+    ],
   };
 }
