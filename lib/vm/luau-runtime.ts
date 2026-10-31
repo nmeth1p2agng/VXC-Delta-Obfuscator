@@ -5,6 +5,7 @@ import {
 
 import {
   OPCODES,
+  SUPPORTED_RUNTIME_OPCODES,
   validateVMProgram,
   type VMProgram,
   type VMConstant,
@@ -18,18 +19,9 @@ import {
 const MAX_VM_STEPS = 100000;
 const UINT32_MOD = 4294967296;
 
-const SUPPORTED_OPCODES = new Set<Opcode>([
-  OPCODES.LOADK,
-  OPCODES.MOVE,
-  OPCODES.ADD,
-  OPCODES.SUB,
-  OPCODES.MUL,
-  OPCODES.DIV,
-  OPCODES.MOD,
-  OPCODES.POW,
-  OPCODES.NEG,
-  OPCODES.RETURN,
-]);
+const SUPPORTED_OPCODES = new Set<Opcode>(
+  SUPPORTED_RUNTIME_OPCODES
+);
 
 function formatNumber(value: number): string {
   if (!Number.isFinite(value)) {
@@ -67,7 +59,6 @@ function formatConstant(value: VMConstant): string {
   if (typeof value === "number") {
     const canonical = formatNumber(value);
 
-    // Numeric constants are stored as canonical strings.
     return `{3,${formatString(canonical)}}`;
   }
 
@@ -88,17 +79,17 @@ function formatInstruction(
 
 /**
  * Creates a deterministic fingerprint from the VM payload.
- *
- * Numeric constants use canonical string representations.
- * This avoids relying on different number formatting
- * between JavaScript and Luau.
  */
 function createPayloadFingerprint(
   program: VMProgram
 ): number {
   const parts: string[] = [];
 
-  for (let i = 0; i < program.constants.length; i++) {
+  for (
+    let i = 0;
+    i < program.constants.length;
+    i++
+  ) {
     const value = program.constants[i];
     const index = i + 1;
 
@@ -113,6 +104,7 @@ function createPayloadFingerprint(
 
     } else if (typeof value === "number") {
       const canonical = formatNumber(value);
+
       const length = new TextEncoder()
         .encode(canonical).length;
 
@@ -156,7 +148,7 @@ function createPayloadFingerprint(
 }
 
 /**
- * Validates the complete VM program before rendering.
+ * Validate the complete VM program before rendering.
  */
 function validateRuntimeProgram(
   program: VMProgram
@@ -211,13 +203,15 @@ function validateRuntimeProgram(
 /**
  * Generate a standalone Luau interpreter.
  *
- * Features:
+ * Stage 5P-E:
  * - Runtime instruction validation
  * - Dedicated opcode handler table
- * - Register-based execution
- * - Execution step limit
+ * - Register initialization tracking
+ * - Register boundary validation
+ * - Constant pool validation
  * - Canonical numeric constants
  * - Payload fingerprint verification
+ * - Execution step limit
  */
 export function renderLuauVM(
   program: VMProgram,
@@ -246,6 +240,8 @@ export function renderLuauVM(
   const expectedFingerprint =
     createPayloadFingerprint(program);
 
+  const registerLimit = program.registerCount;
+
   const payload = `
 local _p = {
     c = {${constants}},
@@ -255,10 +251,18 @@ local _p = {
 
   return `${payload}
 return (function()
+    -- =================================
+    -- VM STATE
+    -- =================================
+
     local _r = {}
+    local _initialized = {}
+
     local _pc = 1
     local _steps = 0
+
     local _limit = ${maxSteps}
+    local _registerLimit = ${registerLimit}
     local _expected = ${expectedFingerprint}
 
     -- =================================
@@ -349,7 +353,6 @@ return (function()
         return hash
     end
 
-    -- Verify payload before execution.
     if _fingerprint(_p) ~= _expected then
         error(
             "VXC Integrity: payload modification detected",
@@ -358,7 +361,47 @@ return (function()
     end
 
     -- =================================
-    -- VALUE VALIDATION
+    -- REGISTER INTEGRITY
+    -- =================================
+
+    local function _validateRegister(index)
+        if type(index) ~= "number"
+            or index % 1 ~= 0
+            or index < 1
+            or index > _registerLimit then
+
+            error(
+                "VXC VM: register index out of bounds",
+                0
+            )
+        end
+    end
+
+    local function _writeRegister(index, value)
+        _validateRegister(index)
+
+        _r[index] = value
+
+        -- Track initialization separately.
+        -- This also supports registers containing nil.
+        _initialized[index] = true
+    end
+
+    local function _readRegister(index)
+        _validateRegister(index)
+
+        if not _initialized[index] then
+            error(
+                "VXC VM: uninitialized register access",
+                0
+            )
+        end
+
+        return _r[index]
+    end
+
+    -- =================================
+    -- NUMBER VALIDATION
     -- =================================
 
     local function _number(value, register)
@@ -382,11 +425,22 @@ return (function()
     -- =================================
 
     local function _loadConstant(index)
+        if type(index) ~= "number"
+            or index % 1 ~= 0
+            or index < 1
+            or index > #_p.c then
+
+            error(
+                "VXC VM: invalid constant index",
+                0
+            )
+        end
+
         local constant = _p.c[index]
 
         if type(constant) ~= "table" then
             error(
-                "VXC VM: invalid constant index",
+                "VXC VM: malformed constant",
                 0
             )
         end
@@ -441,72 +495,94 @@ return (function()
 
     local _handlers = {
         [${OPCODES.LOADK}] = function(a, b, c)
-            _r[a] = _loadConstant(b)
+            _writeRegister(
+                a,
+                _loadConstant(b)
+            )
+
             return nil, false
         end,
 
         [${OPCODES.MOVE}] = function(a, b, c)
-            _r[a] = _r[b]
+            _writeRegister(
+                a,
+                _readRegister(b)
+            )
+
             return nil, false
         end,
 
         [${OPCODES.ADD}] = function(a, b, c)
-            _r[a] =
-                _number(_r[b], b)
-                + _number(_r[c], c)
+            _writeRegister(
+                a,
+                _number(_readRegister(b), b)
+                + _number(_readRegister(c), c)
+            )
 
             return nil, false
         end,
 
         [${OPCODES.SUB}] = function(a, b, c)
-            _r[a] =
-                _number(_r[b], b)
-                - _number(_r[c], c)
+            _writeRegister(
+                a,
+                _number(_readRegister(b), b)
+                - _number(_readRegister(c), c)
+            )
 
             return nil, false
         end,
 
         [${OPCODES.MUL}] = function(a, b, c)
-            _r[a] =
-                _number(_r[b], b)
-                * _number(_r[c], c)
+            _writeRegister(
+                a,
+                _number(_readRegister(b), b)
+                * _number(_readRegister(c), c)
+            )
 
             return nil, false
         end,
 
         [${OPCODES.DIV}] = function(a, b, c)
-            _r[a] =
-                _number(_r[b], b)
-                / _number(_r[c], c)
+            _writeRegister(
+                a,
+                _number(_readRegister(b), b)
+                / _number(_readRegister(c), c)
+            )
 
             return nil, false
         end,
 
         [${OPCODES.MOD}] = function(a, b, c)
-            _r[a] =
-                _number(_r[b], b)
-                % _number(_r[c], c)
+            _writeRegister(
+                a,
+                _number(_readRegister(b), b)
+                % _number(_readRegister(c), c)
+            )
 
             return nil, false
         end,
 
         [${OPCODES.POW}] = function(a, b, c)
-            _r[a] =
-                _number(_r[b], b)
-                ^ _number(_r[c], c)
+            _writeRegister(
+                a,
+                _number(_readRegister(b), b)
+                ^ _number(_readRegister(c), c)
+            )
 
             return nil, false
         end,
 
         [${OPCODES.NEG}] = function(a, b, c)
-            _r[a] =
-                -_number(_r[b], b)
+            _writeRegister(
+                a,
+                -_number(_readRegister(b), b)
+            )
 
             return nil, false
         end,
 
         [${OPCODES.RETURN}] = function(a, b, c)
-            return _r[a], true
+            return _readRegister(a), true
         end
     }
 
@@ -533,7 +609,34 @@ return (function()
             )
         end
 
+        if #instruction ~= 4 then
+            error(
+                "VXC VM: invalid instruction shape",
+                0
+            )
+        end
+
         local opcode = instruction[1]
+        local rawA = instruction[2]
+        local rawB = instruction[3]
+        local rawC = instruction[4]
+
+        for _, operand in ipairs({
+            opcode,
+            rawA,
+            rawB,
+            rawC
+        }) do
+            if type(operand) ~= "number"
+                or operand % 1 ~= 0 then
+
+                error(
+                    "VXC VM: malformed instruction operand",
+                    0
+                )
+            end
+        end
+
         local handler = _handlers[opcode]
 
         if type(handler) ~= "function" then
@@ -543,9 +646,11 @@ return (function()
             )
         end
 
-        local a = instruction[2] + 1
-        local b = instruction[3] + 1
-        local c = instruction[4] + 1
+        -- Compiler register indexes are zero-based.
+        -- Runtime register indexes are one-based.
+        local a = rawA + 1
+        local b = rawB + 1
+        local c = rawC + 1
 
         local result, halted =
             handler(a, b, c)
