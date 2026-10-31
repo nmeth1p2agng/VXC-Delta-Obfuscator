@@ -1,8 +1,8 @@
-
 import { tokenizeLuau, LuauToken } from "../tokenizer";
 
 export interface IdentifierEdit {
   name: string;
+  bindingId: number;
   start: number;
   end: number;
   replacement: string;
@@ -14,640 +14,296 @@ export interface IdentifierAnalysis {
   supported: boolean;
 }
 
+interface Binding {
+  id: number;
+  name: string;
+  declarationIndex: number;
+  visibleFrom: number;
+  scope: Scope;
+}
+
 interface Scope {
   id: number;
   start: number;
   end: number;
   parent: Scope | null;
-  declarations: Declaration[];
+  bindings: Binding[];
 }
 
-interface Declaration {
-  name: string;
-  tokenIndex: number;
-  startIndex: number;
-  scope: Scope;
-}
-
+type BlockKind = "function" | "if" | "loop" | "do" | "repeat";
 interface BlockFrame {
-  kind: "function" | "if" | "do" | "repeat" | "loop";
+  kind: BlockKind;
   scope: Scope;
-  branchScope?: Scope;
+  branch?: Scope;
   awaitingDo?: boolean;
 }
 
-const CONTROL_CONTINUATIONS = new Set([
-  "+", "-", "*", "/", "//", "%", "^", "..", "and", "or",
-  "==", "~=", "<", ">", "<=", ">=", "=", ",", ".", ":",
-  "(", "[", "{", "then", "do", "in",
+const TYPE_WORDS = new Set([
+  "any", "unknown", "never", "nil", "boolean", "number", "string",
+  "thread", "userdata", "vector", "true", "false", "typeof",
 ]);
 
-function isIdentifier(token?: LuauToken): boolean {
+function isId(token: LuauToken | undefined): token is LuauToken {
   return token?.type === "identifier";
 }
-
-function isKeyword(token: LuauToken | undefined, value: string): boolean {
+function isKw(token: LuauToken | undefined, value: string): boolean {
   return token?.type === "keyword" && token.value === value;
+}
+function isName(token: LuauToken | undefined, value: string): boolean {
+  return token?.value === value;
+}
+
+function matchingParen(tokens: LuauToken[], open: number): number {
+  let depth = 0;
+  for (let i = open; i < tokens.length; i++) {
+    if (tokens[i].value === "(") depth++;
+    else if (tokens[i].value === ")" && --depth === 0) return i;
+  }
+  return -1;
+}
+
+function isStatementStarter(tokens: LuauToken[], index: number): boolean {
+  const token = tokens[index];
+  if (!token) return false;
+  if (["local", "return", "if", "for", "while", "repeat", "do", "break", "continue"].includes(token.value)) return true;
+  if (token.type !== "identifier") return false;
+  const next = tokens[index + 1];
+  const previous = tokens[index - 1];
+  const endsExpression = previous && (
+    previous.type === "identifier" || previous.type === "number" ||
+    previous.type === "string" || previous.type === "long_string" ||
+    [")", "]", "}"].includes(previous.value)
+  );
+  return Boolean(endsExpression && (next?.value === "(" || next?.value === ":"));
+}
+
+function findStatementEnd(tokens: LuauToken[], source: string, start: number): number {
+  let round = 0, square = 0, curly = 0, blockDepth = 0;
+  for (let i = start; i < tokens.length; i++) {
+    const v = tokens[i].value;
+    if (i > start && round === 0 && square === 0 && curly === 0 && blockDepth === 0 && isStatementStarter(tokens, i)) return i;
+    if (v === "(") round++;
+    else if (v === ")") round = Math.max(0, round - 1);
+    else if (v === "[") square++;
+    else if (v === "]") square = Math.max(0, square - 1);
+    else if (v === "{") curly++;
+    else if (v === "}") curly = Math.max(0, curly - 1);
+
+    // Multiline function expressions and nested blocks belong to the initializer.
+    if (["function", "if", "do", "for", "while", "repeat"].includes(v)) blockDepth++;
+    else if (v === "end" || v === "until") blockDepth = Math.max(0, blockDepth - 1);
+
+    if (round || square || curly || blockDepth) continue;
+    if (v === ";") return i + 1;
+    const next = tokens[i + 1];
+    if (!next) return i + 1;
+    const gap = source.slice(tokens[i].end, next.start);
+    if (/\r?\n/.test(gap) && ![",", ".", ":", "..", "+", "-", "*", "/", "//", "%", "^", "and", "or", "==", "~=", "<", ">", "<=", ">=", "=", "(", "[", "{"].includes(next.value)) return i + 1;
+    if (isStatementStarter(tokens, i + 1)) return i + 1;
+  }
+  return tokens.length;
 }
 
 function isPropertyOrKey(tokens: LuauToken[], index: number): boolean {
   const previous = tokens[index - 1];
   const next = tokens[index + 1];
-
-  if (previous?.value === "." || previous?.value === ":") {
-    return true;
-  }
-
-  if (
-    next?.value === "=" &&
-    (previous?.value === "{" || previous?.value === ",")
-  ) {
-    return true;
-  }
-
+  if (previous?.value === "." || previous?.value === ":" || previous?.value === "::") return true;
+  if (next?.value === "=" && (previous?.value === "{" || previous?.value === ",")) return true;
   return false;
 }
 
-function matchingParen(tokens: LuauToken[], open: number): number {
-  let depth = 0;
-
-  for (let i = open; i < tokens.length; i++) {
-    if (tokens[i].value === "(") {
-      depth++;
-    } else if (tokens[i].value === ")") {
-      depth--;
-
-      if (depth === 0) {
-        return i;
-      }
-    }
+function inTypeContext(tokens: LuauToken[], index: number): boolean {
+  // Do not rewrite type aliases, generic declarations, or annotations.
+  // A conservative skip is safer than changing a type-level identifier.
+  for (let i = index - 1; i >= 0 && index - i < 80; i--) {
+    const v = tokens[i].value;
+    if (v === "=" || v === ";" || v === "then" || v === "do" || v === "return") return false;
+    if (v === "type" || v === "export" || v === "declare") return true;
+    if (v === "local" || v === "function") return false;
+    if (v === "::") return true;
   }
-
-  return -1;
+  return false;
 }
 
-function createScope(
-  id: number,
-  start: number,
-  parent: Scope | null,
-): Scope {
-  return {
-    id,
-    start,
-    end: Number.MAX_SAFE_INTEGER,
-    parent,
-    declarations: [],
-  };
-}
-
-function findInnermostScope(
-  scopes: Scope[],
-  index: number,
-): Scope {
-  let best = scopes[0];
-
-  for (const scope of scopes) {
-    if (
-      scope.start <= index &&
-      index <= scope.end &&
-      scope.start >= best.start
-    ) {
-      best = scope;
-    }
-  }
-
-  return best;
-}
-
-function statementEnd(
-  tokens: LuauToken[],
-  source: string,
-  start: number,
-): number {
-  let round = 0;
-  let square = 0;
-  let curly = 0;
-
-  for (let i = start; i < tokens.length; i++) {
-    const value = tokens[i].value;
-
-    if (value === "(") round++;
-    else if (value === ")") round = Math.max(0, round - 1);
-    else if (value === "[") square++;
-    else if (value === "]") square = Math.max(0, square - 1);
-    else if (value === "{") curly++;
-    else if (value === "}") curly = Math.max(0, curly - 1);
-
-    if (round === 0 && square === 0 && curly === 0) {
-      if (value === ";") return i + 1;
-
-      const next = tokens[i + 1];
-
-      if (!next) return i + 1;
-
-      const between = source.slice(
-        tokens[i].end,
-        next.start,
-      );
-
-      if (
-        /\r?\n/.test(between) &&
-        !CONTROL_CONTINUATIONS.has(next.value)
-      ) {
-        return i + 1;
-      }
-
-      if (
-        ["end", "else", "elseif", "until"].includes(next.value)
-      ) {
-        return i + 1;
-      }
-    }
-  }
-
-  return tokens.length;
-}
-
-export function analyzeIdentifiers(
-  source: string,
-): IdentifierAnalysis {
+export function analyzeIdentifiers(source: string): IdentifierAnalysis {
   let tokens: LuauToken[];
-
   try {
     tokens = tokenizeLuau(source);
   } catch (error) {
-    return {
-      edits: [],
-      warnings: [
-        `Identifier analysis skipped: ${(error as Error).message}`,
-      ],
-      supported: false,
-    };
+    return { edits: [], warnings: [`Tokenizer rejected source: ${error instanceof Error ? error.message : "unknown error"}`], supported: false };
   }
 
-  const root = createScope(0, 0, null);
+  const warnings: string[] = [];
+  let scopeId = 0;
+  let bindingId = 0;
+  const root: Scope = { id: scopeId++, start: 0, end: tokens.length, parent: null, bindings: [] };
   const scopes: Scope[] = [root];
   const frames: BlockFrame[] = [];
+  const loopScopes = new Map<number, Scope>();
+  const tokenScopes: Scope[] = new Array(tokens.length);
 
-  let nextScopeId = 1;
-
-  const warnings: string[] = [];
-
-  const openScope = (
-    start: number,
-    parent?: Scope,
-  ): Scope => {
-    const scope = createScope(
-      nextScopeId++,
-      start,
-      parent ?? findInnermostScope(scopes, start),
-    );
-
+  const makeScope = (start: number, parent: Scope): Scope => {
+    const scope: Scope = { id: scopeId++, start, end: tokens.length, parent, bindings: [] };
     scopes.push(scope);
-
     return scope;
   };
+  const currentScope = (): Scope => frames.length ? (frames[frames.length - 1].branch ?? frames[frames.length - 1].scope) : root;
 
-  // PASS 1: BUILD BLOCK SCOPES
-
+  // Build lexical block scopes. Branches of if/elseif/else are siblings.
   for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i];
-
-    if (isKeyword(token, "function")) {
-      const scope = openScope(i + 1);
-
-      frames.push({
-        kind: "function",
-        scope,
-      });
-
-      continue;
-    }
-
-    if (isKeyword(token, "if")) {
-      const scope = openScope(i + 1);
-
-      frames.push({
-        kind: "if",
-        scope,
-      });
-
-      continue;
-    }
-
-    if (
-      isKeyword(token, "for") ||
-      isKeyword(token, "while")
-    ) {
-      const scope = openScope(i + 1);
-
-      frames.push({
-        kind: "loop",
-        scope,
-        awaitingDo: true,
-      });
-
-      continue;
-    }
-
-    if (isKeyword(token, "repeat")) {
-      const scope = openScope(i + 1);
-
-      frames.push({
-        kind: "repeat",
-        scope,
-      });
-
-      continue;
-    }
-
-    if (isKeyword(token, "then")) {
-      const frame = [...frames]
-        .reverse()
-        .find((item) => item.kind === "if");
-
-      if (frame) {
-        frame.branchScope = openScope(
-          i + 1,
-          frame.scope,
-        );
+    tokenScopes[i] = currentScope();
+    const t = tokens[i];
+    if (isKw(t, "function")) {
+      const s = makeScope(i, currentScope());
+      frames.push({ kind: "function", scope: s });
+    } else if (isKw(t, "if")) {
+      const s = makeScope(i, currentScope());
+      frames.push({ kind: "if", scope: s });
+    } else if (isKw(t, "for") || isKw(t, "while")) {
+      const s = makeScope(i, currentScope());
+      if (isKw(t, "for")) loopScopes.set(i, s);
+      frames.push({ kind: "loop", scope: s, awaitingDo: true });
+    } else if (isKw(t, "repeat")) {
+      const s = makeScope(i + 1, currentScope());
+      frames.push({ kind: "repeat", scope: s });
+    } else if (isKw(t, "then")) {
+      const f = [...frames].reverse().find(x => x.kind === "if");
+      if (f) f.branch = makeScope(i + 1, f.scope.parent ?? root);
+    } else if (isKw(t, "elseif") || isKw(t, "else")) {
+      const f = [...frames].reverse().find(x => x.kind === "if");
+      if (f) {
+        if (f.branch) f.branch.end = i;
+        f.branch = isKw(t, "else") ? makeScope(i + 1, f.scope.parent ?? root) : undefined;
       }
-
-      continue;
-    }
-
-    if (
-      isKeyword(token, "elseif") ||
-      isKeyword(token, "else")
-    ) {
-      const frame = [...frames]
-        .reverse()
-        .find((item) => item.kind === "if");
-
-      if (frame?.branchScope) {
-        frame.branchScope.end = i;
-        frame.branchScope = undefined;
-      }
-
-      if (isKeyword(token, "else") && frame) {
-        frame.branchScope = openScope(
-          i + 1,
-          frame.scope,
-        );
-      }
-
-      continue;
-    }
-
-    if (isKeyword(token, "do")) {
-      const loop = [...frames]
-        .reverse()
-        .find(
-          (item) =>
-            item.kind === "loop" &&
-            item.awaitingDo,
-        );
-
+    } else if (isKw(t, "do")) {
+      const loop = [...frames].reverse().find(x => x.kind === "loop" && x.awaitingDo);
       if (loop) {
         loop.awaitingDo = false;
         loop.scope.start = i + 1;
       } else {
-        const scope = openScope(i + 1);
-
-        frames.push({
-          kind: "do",
-          scope,
-        });
+        frames.push({ kind: "do", scope: makeScope(i + 1, currentScope()) });
       }
-
-      continue;
-    }
-
-    if (isKeyword(token, "until")) {
-      const frame = frames.pop();
-
-      if (frame?.kind === "repeat") {
-        frame.scope.end = i;
-      } else if (frame) {
-        frames.push(frame);
+    } else if (isKw(t, "until")) {
+      // Repeat locals remain visible in the until condition.
+      const f = frames.pop();
+      if (f?.kind === "repeat") f.scope.end = findStatementEnd(tokens, source, i + 1);
+      else if (f) frames.push(f);
+    } else if (isKw(t, "end")) {
+      const f = frames.pop();
+      if (!f || f.kind === "repeat") {
+        return { edits: [], warnings: [`Unbalanced block near token ${i}; identifier renaming skipped.`], supported: false };
       }
-
-      continue;
-    }
-
-    if (isKeyword(token, "end")) {
-      const frame = frames.pop();
-
-      if (!frame) {
-        return {
-          edits: [],
-          warnings: [
-            "Identifier protection skipped: unmatched end keyword.",
-          ],
-          supported: false,
-        };
-      }
-
-      frame.scope.end = i;
-
-      if (frame.branchScope) {
-        frame.branchScope.end = i;
-      }
+      f.scope.end = i;
+      if (f.branch) f.branch.end = i;
     }
   }
+  if (frames.length) return { edits: [], warnings: ["Unclosed block; identifier renaming skipped to preserve behavior."], supported: false };
 
-  if (frames.length > 0) {
-    return {
-      edits: [],
-      warnings: [
-        "Identifier protection skipped: unmatched Luau block.",
-      ],
-      supported: false,
-    };
+  // Rebuild token-to-scope after all block boundaries are known.
+  for (let i = 0; i < tokens.length; i++) {
+    let best = root;
+    for (const s of scopes) if (s.start <= i && i <= s.end && s.start >= best.start) best = s;
+    tokenScopes[i] = best;
   }
 
-  root.end = tokens.length;
-
-  // PASS 2: COLLECT DECLARATIONS
-
-  const declarations: Declaration[] = [];
-
-  const addDeclaration = (
-    nameIndex: number,
-    visibleFrom: number,
-    scope: Scope,
-  ) => {
+  const declarations = new Set<number>();
+  const allBindings: Binding[] = [];
+  const addBinding = (nameIndex: number, visibleFrom: number, scope: Scope) => {
     const token = tokens[nameIndex];
-
-    if (!isIdentifier(token)) return;
-
-    const declaration: Declaration = {
-      name: token.value,
-      tokenIndex: nameIndex,
-      startIndex: visibleFrom,
-      scope,
-    };
-
-    scope.declarations.push(declaration);
-    declarations.push(declaration);
+    if (!isId(token)) return;
+    const b: Binding = { id: bindingId++, name: token.value, declarationIndex: nameIndex, visibleFrom, scope };
+    scope.bindings.push(b);
+    allBindings.push(b);
+    declarations.add(nameIndex);
   };
 
+  // Local declarations. Initializer expressions are evaluated before the new locals enter scope.
   for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i];
-
-    // LOCAL FUNCTION
-
-    if (isKeyword(token, "local")) {
-      if (isKeyword(tokens[i + 1], "function")) {
-        const nameIndex = i + 2;
-        const scope = findInnermostScope(scopes, i);
-
-        addDeclaration(nameIndex, i, scope);
-
-        continue;
-      }
-
-      // LOCAL VARIABLES
-
-      const names: number[] = [];
-
-      let cursor = i + 1;
-
-      while (isIdentifier(tokens[cursor])) {
-        names.push(cursor++);
-
-        if (tokens[cursor]?.value !== ",") {
-          break;
-        }
-
-        cursor++;
-      }
-
-      if (names.length === 0) continue;
-
-      const hasInitializer =
-        tokens[cursor]?.value === "=";
-
-      const end = hasInitializer
-        ? statementEnd(tokens, source, cursor + 1)
-        : cursor;
-
-      const rhsStart = hasInitializer
-        ? tokens[cursor].end
-        : tokens[names[names.length - 1]].end;
-
-      const rhsEnd =
-        hasInitializer && end > cursor + 1
-          ? tokens[end - 1].end
-          : rhsStart;
-
-      const rhsText = source.slice(rhsStart, rhsEnd);
-
-      const multiline =
-        /\r?\n/.test(rhsText) && hasInitializer;
-
-      const scope = findInnermostScope(scopes, i);
-
-      if (multiline) {
-        warnings.push(
-          "A multiline local initializer was left unchanged for safety.",
-        );
-      } else {
-        const visibleFrom = hasInitializer
-          ? end
-          : names[names.length - 1] + 1;
-
-        for (const nameIndex of names) {
-          addDeclaration(
-            nameIndex,
-            visibleFrom,
-            scope,
-          );
-        }
-      }
-
+    if (!isKw(tokens[i], "local")) continue;
+    const scope = tokenScopes[i] ?? root;
+    if (isKw(tokens[i + 1], "function")) {
+      if (isId(tokens[i + 2])) addBinding(i + 2, i, scope);
       continue;
     }
-
-    // FUNCTION PARAMETERS
-
-    if (isKeyword(token, "function")) {
-      let open = i + 1;
-
-      while (
-        open < tokens.length &&
-        tokens[open].value !== "("
-      ) {
-        open++;
-      }
-
-      if (open >= tokens.length) continue;
-
-      const close = matchingParen(tokens, open);
-
-      if (close < 0) continue;
-
-      const functionScope = scopes.find(
-        (scope) =>
-          scope.start === i + 1 &&
-          scope !== root,
-      );
-
-      if (!functionScope) continue;
-
-      // IMPLICIT SELF FOR COLON METHODS
-
-      const methodNameIndex = i - 1;
-
-      if (
-        tokens[methodNameIndex]?.type === "identifier" &&
-        tokens[methodNameIndex - 1]?.value === ":"
-      ) {
-        for (
-          let p = close + 1;
-          p < functionScope.end;
-          p++
-        ) {
-          if (
-            isIdentifier(tokens[p]) &&
-            tokens[p].value === "self"
-          ) {
-            addDeclaration(
-              p,
-              functionScope.start,
-              functionScope,
-            );
-
-            break;
-          }
-        }
-      }
-
-      for (let p = open + 1; p < close; p++) {
-        if (
-          isIdentifier(tokens[p]) &&
-          (
-            p === open + 1 ||
-            tokens[p - 1].value === ","
-          )
-        ) {
-          addDeclaration(
-            p,
-            functionScope.start,
-            functionScope,
-          );
-        }
-      }
+    let p = i + 1;
+    const names: number[] = [];
+    while (isId(tokens[p])) {
+      names.push(p++);
+      if (tokens[p]?.value !== ",") break;
+      p++;
     }
+    if (!names.length) continue;
+    // Luau typed locals: local x: T = value. Keep this binding safe; don't parse type syntax as names.
+    if (tokens[p]?.value === ":") {
+      const end = findStatementEnd(tokens, source, p + 1);
+      for (const n of names) addBinding(n, end, scope);
+      warnings.push("Typed local declarations detected; type annotations are preserved.");
+      continue;
+    }
+    const hasInit = tokens[p]?.value === "=";
+    const end = hasInit ? findStatementEnd(tokens, source, p + 1) : p;
+    for (const n of names) addBinding(n, hasInit ? end : n + 1, scope);
+  }
 
-    // FOR LOOP VARIABLES
-
-    if (isKeyword(token, "for")) {
-      const scope = [...scopes]
-        .filter(
-          (item) =>
-            item !== root &&
-            item.start >= i + 1,
-        )
-        .sort((a, b) => a.start - b.start)[0];
-
-      if (!scope) continue;
-
-      let cursor = i + 1;
-
-      while (isIdentifier(tokens[cursor])) {
-        addDeclaration(
-          cursor,
-          scope.start,
-          scope,
-        );
-
-        cursor++;
-
-        if (tokens[cursor]?.value !== ",") {
-          break;
-        }
-
-        cursor++;
-      }
+  // Function parameters and implicit self.
+  for (let i = 0; i < tokens.length; i++) {
+    if (!isKw(tokens[i], "function")) continue;
+    let open = i + 1;
+    while (open < tokens.length && tokens[open].value !== "(") open++;
+    if (open >= tokens.length) continue;
+    const close = matchingParen(tokens, open);
+    if (close < 0) continue;
+    const fnScope = scopes.find(s => s.start === i);
+    if (!fnScope) continue;
+    const method = tokens[i - 1]?.value === ":";
+    if (method) {
+      // self is an implicit parameter. Only rewrite references within this method body.
+      const firstBody = close + 1;
+      const selfToken = tokens.findIndex((t, idx) => idx >= firstBody && idx <= fnScope.end && t.type === "identifier" && t.value === "self");
+      if (selfToken >= 0) addBinding(selfToken, fnScope.start, fnScope);
+    }
+    for (let p = open + 1; p < close; p++) {
+      if (isId(tokens[p]) && (p === open + 1 || tokens[p - 1].value === ",")) addBinding(p, fnScope.start, fnScope);
     }
   }
 
-  // PASS 3: RESOLVE IDENTIFIER REFERENCES
+  // Generic and numeric for-loop variables are scoped to the loop body.
+  for (let i = 0; i < tokens.length; i++) {
+    if (!isKw(tokens[i], "for")) continue;
+    const loop = loopScopes.get(i);
+    if (!loop) continue;
+    let p = i + 1;
+    while (p < tokens.length && !isKw(tokens[p], "do")) {
+      if (isId(tokens[p]) && (p === i + 1 || tokens[p - 1].value === ",")) addBinding(p, loop.start, loop);
+      p++;
+    }
+  }
 
+  // Resolve each identifier to its nearest visible lexical binding.
   const edits: IdentifierEdit[] = [];
-
-  const declarationIndexes = new Set(
-    declarations.map((item) => item.tokenIndex),
-  );
-
-  const resolved = new Map<number, Declaration>();
-
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
-
-    if (
-      !isIdentifier(token) ||
-      declarationIndexes.has(i) ||
-      isPropertyOrKey(tokens, i)
-    ) {
-      continue;
-    }
-
-    let scope: Scope | null =
-      findInnermostScope(scopes, i);
-
-    let match: Declaration | undefined;
-
+    if (!isId(token) || declarations.has(i) || isPropertyOrKey(tokens, i) || inTypeContext(tokens, i)) continue;
+    if (TYPE_WORDS.has(token.value)) continue;
+    let scope: Scope | null = tokenScopes[i] ?? root;
+    let found: Binding | undefined;
     while (scope) {
-      match = scope.declarations
-        .filter(
-          (item) =>
-            item.name === token.value &&
-            item.startIndex <= i,
-        )
-        .sort(
-          (a, b) =>
-            b.startIndex - a.startIndex,
-        )[0];
-
-      if (match) break;
-
+      found = scope.bindings
+        .filter(b => b.name === token.value && b.visibleFrom <= i)
+        .sort((a, b) => b.visibleFrom - a.visibleFrom)[0];
+      if (found) break;
       scope = scope.parent;
     }
-
-    if (match) {
-      resolved.set(i, match);
-    }
+    if (found) edits.push({ name: found.name, bindingId: found.id, start: token.start, end: token.end, replacement: "" });
   }
 
-  // PASS 4: GENERATE SOURCE EDITS
-
-  for (const declaration of declarations) {
-    const token = tokens[declaration.tokenIndex];
-
-    edits.push({
-      name: declaration.name,
-      start: token.start,
-      end: token.end,
-      replacement: "",
-    });
+  for (const binding of allBindings) {
+    const token = tokens[binding.declarationIndex];
+    edits.push({ name: binding.name, bindingId: binding.id, start: token.start, end: token.end, replacement: "" });
   }
 
-  for (const [index, declaration] of resolved) {
-    const token = tokens[index];
-
-    edits.push({
-      name: declaration.name,
-      start: token.start,
-      end: token.end,
-      replacement: "",
-    });
-  }
-
-  return {
-    edits,
-    warnings,
-    supported: true,
-  };
+  // A token can be claimed only once; reject overlapping or duplicate edits.
+  const unique = new Map<number, IdentifierEdit>();
+  for (const edit of edits) unique.set(edit.start, edit);
+  return { edits: [...unique.values()], warnings, supported: true };
 }
