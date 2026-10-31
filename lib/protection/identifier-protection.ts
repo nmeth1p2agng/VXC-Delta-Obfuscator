@@ -1,8 +1,7 @@
-
 import { randomBytes } from "node:crypto";
 import {
   analyzeIdentifiers,
-  type IdentifierEdit,
+  IdentifierEdit
 } from "./scope-analyzer";
 
 export interface IdentifierProtectionResult {
@@ -22,91 +21,95 @@ function generateName(existing: Set<string>): string {
   return name;
 }
 
-export function protectIdentifiers(
-  source: string,
-): IdentifierProtectionResult {
-  let analysis;
+function reject(source: string, warnings: string[]): IdentifierProtectionResult {
+  return {
+    output: source,
+    renamed: 0,
+    warnings
+  };
+}
 
-  try {
-    analysis = analyzeIdentifiers(source);
-  } catch (error) {
-    return {
-      output: source,
-      renamed: 0,
-      warnings: [
-        `Identifier analysis failed: ${
-          error instanceof Error
-            ? error.message
-            : "unknown error"
-        }`,
-      ],
-    };
+export function protectIdentifiers(
+  source: string
+): IdentifierProtectionResult {
+  const analysis = analyzeIdentifiers(source);
+  const warnings = [...analysis.warnings];
+
+  if (!analysis.supported) {
+    warnings.push("Identifier protection was skipped because scope analysis was inconclusive.");
+    return reject(source, warnings);
   }
 
-  if (!analysis.supported || analysis.edits.length === 0) {
-    return {
-      output: source,
-      renamed: 0,
-      warnings: analysis.warnings,
-    };
+  if (analysis.edits.length === 0) {
+    return { output: source, renamed: 0, warnings };
   }
 
   const existing = new Set(
-    source.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? [],
+    source.match(/[a-zA-Z_][a-zA-Z0-9_]*/g) ?? []
   );
 
-  // Scope analyzer versi repository saat ini hanya
-  // menghasilkan edit untuk identifier yang sudah
-  // lolos analisis konservatif.
-  const replacements = new Map<string, string>();
+  // A binding is one declaration plus all references resolved to that declaration.
+  // Never group by spelling alone: two different scopes may reuse the same name.
+  const replacements = new Map<number, string>();
+  const occupiedRanges = new Set<string>();
 
   for (const edit of analysis.edits) {
-    if (!replacements.has(edit.name)) {
-      replacements.set(
-        edit.name,
-        generateName(existing),
-      );
+    if (!Number.isInteger(edit.bindingId) || edit.bindingId < 0) {
+      warnings.push("Invalid binding identity; identifier protection was skipped.");
+      return reject(source, warnings);
     }
-  }
 
-  const edits: IdentifierEdit[] = analysis.edits
-    .map((edit) => ({
-      ...edit,
-      replacement: replacements.get(edit.name)!,
-    }))
-    .sort((a, b) => b.start - a.start);
-
-  let output = source;
-  let previousStart = source.length + 1;
-
-  for (const edit of edits) {
     if (
+      !Number.isInteger(edit.start) ||
+      !Number.isInteger(edit.end) ||
       edit.start < 0 ||
       edit.end <= edit.start ||
       edit.end > source.length ||
-      edit.end > previousStart
+      source.slice(edit.start, edit.end) !== edit.name
     ) {
-      return {
-        output: source,
-        renamed: 0,
-        warnings: [
-          ...analysis.warnings,
-          "Identifier transformation aborted because overlapping or invalid source ranges were detected.",
-        ],
-      };
+      warnings.push("Identifier edit did not match the original source; protection was skipped to avoid corrupting code.");
+      return reject(source, warnings);
     }
 
+    const rangeKey = `${edit.start}:${edit.end}`;
+    if (occupiedRanges.has(rangeKey)) {
+      warnings.push("Duplicate identifier edit detected; protection was skipped.");
+      return reject(source, warnings);
+    }
+    occupiedRanges.add(rangeKey);
+
+    if (!replacements.has(edit.bindingId)) {
+      replacements.set(edit.bindingId, generateName(existing));
+    }
+  }
+
+  const edits: IdentifierEdit[] = analysis.edits.map(edit => ({
+    ...edit,
+    replacement: replacements.get(edit.bindingId)!
+  }));
+
+  // Reject overlaps before applying edits from right to left.
+  const ascending = [...edits].sort((a, b) => a.start - b.start);
+  for (let i = 1; i < ascending.length; i++) {
+    if (ascending[i].start < ascending[i - 1].end) {
+      warnings.push("Overlapping identifier edits detected; protection was skipped.");
+      return reject(source, warnings);
+    }
+  }
+
+  edits.sort((a, b) => b.start - a.start);
+  let output = source;
+
+  for (const edit of edits) {
     output =
       output.slice(0, edit.start) +
       edit.replacement +
       output.slice(edit.end);
-
-    previousStart = edit.start;
   }
 
   return {
     output,
     renamed: replacements.size,
-    warnings: analysis.warnings,
+    warnings
   };
 }
