@@ -1,5 +1,4 @@
-import type { VMProgram } from "./instruction-set";
-import { compileLuauToVM } from "./luau-compiler";
+import { compileToLuauVM } from "./vm-pipeline";
 import { analyzeLuauCompatibility } from "./compatibility-analyzer";
 
 export type HybridMode = "vm" | "native-fallback";
@@ -10,8 +9,11 @@ export type HybridPipelineResult = {
   vmReady: boolean;
   sourcePreserved: boolean;
   originalLength: number;
-  program: VMProgram | null;
   output: string;
+  bytecodeSize: number;
+  instructionCount: number;
+  constantCount: number;
+  registerCount: number;
   error: string | null;
   warnings: string[];
 };
@@ -19,8 +21,21 @@ export type HybridPipelineResult = {
 const MAX_SOURCE_LENGTH = 100_000;
 
 export function compileHybridSource(
-  source: string
+  source: string,
+  maxSteps = 100_000
 ): HybridPipelineResult {
+  if (typeof source !== "string") {
+    throw new Error("Source must be a string.");
+  }
+
+  if (!source.trim()) {
+    throw new Error("Source code cannot be empty.");
+  }
+
+  if (source.length > MAX_SOURCE_LENGTH) {
+    throw new Error("Source exceeds the 100000 character limit.");
+  }
+
   const fallback = (
     message: string,
     warnings: string[] = []
@@ -30,65 +45,37 @@ export function compileHybridSource(
     vmReady: false,
     sourcePreserved: true,
     originalLength: source.length,
-    program: null,
     output: source,
+    bytecodeSize: 0,
+    instructionCount: 0,
+    constantCount: 0,
+    registerCount: 0,
     error: message,
-    warnings,
+    warnings: [
+      ...warnings,
+      "Original source was preserved completely.",
+      "Native fallback is not VM-protected.",
+    ],
   });
 
-  if (typeof source !== "string") {
-    return {
-      success: false,
-      mode: "native-fallback",
-      vmReady: false,
-      sourcePreserved: false,
-      originalLength: 0,
-      program: null,
-      output: "",
-      error: "Source must be a string.",
-      warnings: [],
-    };
-  }
-
-  if (!source.trim()) {
-    return {
-      success: false,
-      mode: "native-fallback",
-      vmReady: false,
-      sourcePreserved: false,
-      originalLength: source.length,
-      program: null,
-      output: "",
-      error: "Source code cannot be empty.",
-      warnings: [],
-    };
-  }
-
-  if (source.length > MAX_SOURCE_LENGTH) {
-    return {
-      success: false,
-      mode: "native-fallback",
-      vmReady: false,
-      sourcePreserved: false,
-      originalLength: source.length,
-      program: null,
-      output: "",
-      error: "Source exceeds the 100000 character limit.",
-      warnings: [],
-    };
-  }
-
-  const compatibility = analyzeLuauCompatibility(source);
-
-  if (!compatibility.structurallyValid) {
-    return fallback(
-      "Source failed structural compatibility analysis.",
-      ["Original source was preserved without VM transformation."]
-    );
-  }
-
   try {
-    const program = compileLuauToVM(source);
+    const compatibility = analyzeLuauCompatibility(source);
+
+    if (!compatibility.structurallyValid) {
+      return fallback(
+        "Source failed structural compatibility analysis."
+      );
+    }
+
+    const result = compileToLuauVM(source, {
+      maxSteps,
+    });
+
+    if (!result.success || !result.output) {
+      return fallback(
+        "VM pipeline did not generate valid output."
+      );
+    }
 
     return {
       success: true,
@@ -96,24 +83,28 @@ export function compileHybridSource(
       vmReady: true,
       sourcePreserved: false,
       originalLength: source.length,
-      program,
-      output: "",
+      output: result.output,
+      bytecodeSize: result.bytecodeSize,
+      instructionCount: result.instructionCount,
+      constantCount: result.constantCount,
+      registerCount: result.registerCount,
       error: null,
       warnings: [
-        "Source was accepted by the current VM compiler.",
-        "VM runtime generation and execution must still be tested.",
+        ...result.warnings,
+        "Bytecode encoding and decoding completed.",
+        "Luau VM runtime generation completed.",
+        "Generated output has not yet been executed in Delta.",
       ],
     };
   } catch (error) {
     const message =
       error instanceof Error
         ? error.message
-        : "Unknown VM compiler error.";
+        : "Unknown VM pipeline error.";
 
     return fallback(message, [
-      "VM compilation was skipped.",
-      "Original source was preserved completely.",
-      "Native fallback is not VM-protected.",
+      "VM pipeline failed.",
+      "VM output was discarded.",
     ]);
   }
 }
