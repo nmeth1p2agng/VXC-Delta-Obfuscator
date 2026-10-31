@@ -34,8 +34,10 @@ export function protectIdentifiers(
       output: source,
       renamed: 0,
       warnings: [
-        `Identifier protection skipped: ${
-          error instanceof Error ? error.message : "unknown error"
+        `Identifier analysis failed: ${
+          error instanceof Error
+            ? error.message
+            : "unknown error"
         }`,
       ],
     };
@@ -53,15 +55,15 @@ export function protectIdentifiers(
     source.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? [],
   );
 
-  // Satu binding mendapat satu nama baru.
-  // Variabel dengan nama sama di scope berbeda
-  // tetap mendapatkan nama berbeda.
-  const replacements = new Map<number, string>();
+  // Scope analyzer versi repository saat ini hanya
+  // menghasilkan edit untuk identifier yang sudah
+  // lolos analisis konservatif.
+  const replacements = new Map<string, string>();
 
   for (const edit of analysis.edits) {
-    if (!replacements.has(edit.bindingId)) {
+    if (!replacements.has(edit.name)) {
       replacements.set(
-        edit.bindingId,
+        edit.name,
         generateName(existing),
       );
     }
@@ -70,22 +72,28 @@ export function protectIdentifiers(
   const edits: IdentifierEdit[] = analysis.edits
     .map((edit) => ({
       ...edit,
-      replacement: replacements.get(edit.bindingId)!,
+      replacement: replacements.get(edit.name)!,
     }))
     .sort((a, b) => b.start - a.start);
 
   let output = source;
-  let previousStart = Number.POSITIVE_INFINITY;
+  let previousStart = source.length + 1;
 
   for (const edit of edits) {
-    // Hindari edit duplikat atau bertumpuk.
     if (
       edit.start < 0 ||
       edit.end <= edit.start ||
       edit.end > source.length ||
       edit.end > previousStart
     ) {
-      continue;
+      return {
+        output: source,
+        renamed: 0,
+        warnings: [
+          ...analysis.warnings,
+          "Identifier transformation aborted because overlapping or invalid source ranges were detected.",
+        ],
+      };
     }
 
     output =
