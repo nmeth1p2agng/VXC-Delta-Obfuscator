@@ -1,9 +1,9 @@
 
 /**
- * VXC Instruction Dispatcher
- * Stage 5D
+ * VXC Hardened Instruction Dispatcher
+ * Stage 5P-A
  *
- * Provides validated opcode-to-handler dispatch.
+ * Validated opcode-to-handler dispatch.
  * Execution handlers are supplied by the VM runtime.
  */
 
@@ -54,7 +54,7 @@ function checkRegister(
   name: string
 ): string | null {
   if (
-    !Number.isInteger(index) ||
+    !Number.isSafeInteger(index) ||
     index < 0 ||
     index >= registerCount
   ) {
@@ -70,11 +70,33 @@ function checkConstant(
   pc: number
 ): string | null {
   if (
-    !Number.isInteger(index) ||
+    !Number.isSafeInteger(index) ||
     index < 0 ||
     index >= constantCount
   ) {
     return `Invalid constant index at instruction ${pc}.`;
+  }
+
+  return null;
+}
+
+function validateInstructionShape(
+  instruction: VMInstruction
+): string | null {
+  if (!instruction || typeof instruction !== "object") {
+    return "Instruction must be an object.";
+  }
+
+  if (!isOpcode(instruction.op)) {
+    return "Invalid instruction opcode.";
+  }
+
+  if (
+    !Number.isSafeInteger(instruction.a) ||
+    !Number.isSafeInteger(instruction.b) ||
+    !Number.isSafeInteger(instruction.c)
+  ) {
+    return "Instruction contains invalid operands.";
   }
 
   return null;
@@ -98,6 +120,13 @@ export function validateInstructionOperands(
 
   for (let pc = 0; pc < instructionCount; pc++) {
     const instruction = program.instructions[pc];
+
+    const shapeError = validateInstructionShape(instruction);
+
+    if (shapeError) {
+      errors.push(`${shapeError} At instruction ${pc}.`);
+      continue;
+    }
 
     const register = (
       index: number,
@@ -125,7 +154,7 @@ export function validateInstructionOperands(
 
     const jump = (target: number) => {
       if (
-        !Number.isInteger(target) ||
+        !Number.isSafeInteger(target) ||
         target < 0 ||
         target >= instructionCount
       ) {
@@ -181,8 +210,8 @@ export function validateInstructionOperands(
       case OPCODES.GETGLOBAL:
         register(instruction.a, "destination");
         constant(instruction.b);
+
         if (
-          Number.isInteger(instruction.b) &&
           instruction.b >= 0 &&
           instruction.b < constantCount &&
           typeof program.constants[instruction.b] !== "string"
@@ -198,7 +227,6 @@ export function validateInstructionOperands(
         register(instruction.b, "source");
 
         if (
-          Number.isInteger(instruction.a) &&
           instruction.a >= 0 &&
           instruction.a < constantCount &&
           typeof program.constants[instruction.a] !== "string"
@@ -213,8 +241,6 @@ export function validateInstructionOperands(
         register(instruction.a, "return");
         break;
 
-      // Declared opcodes that do not have an operand
-      // contract in the current VM runtime.
       default:
         errors.push(
           `Opcode ${instruction.op} has no validated operand format at instruction ${pc}.`
@@ -240,12 +266,18 @@ export function createInstructionDispatcher<TContext>(
     options.maxInstructions ?? DEFAULT_MAX_INSTRUCTIONS;
 
   if (
-    !Number.isInteger(maxInstructions) ||
+    !Number.isSafeInteger(maxInstructions) ||
     maxInstructions < 1 ||
     maxInstructions > MAX_ALLOWED_INSTRUCTIONS
   ) {
     throw new Error(
       "VXC Dispatcher: invalid instruction limit."
+    );
+  }
+
+  if (!handlers || typeof handlers !== "object") {
+    throw new Error(
+      "VXC Dispatcher: invalid handler collection."
     );
   }
 
@@ -271,11 +303,22 @@ export function createInstructionDispatcher<TContext>(
     registered.set(opcode, handler);
   }
 
+  // Private counter: callers cannot reset it through the API.
+  let dispatchCount = 0;
+
   return {
     dispatch(instruction, context): void {
-      if (!instruction || !isOpcode(instruction.op)) {
+      const shapeError = validateInstructionShape(instruction);
+
+      if (shapeError) {
         throw new Error(
-          "VXC Dispatcher: invalid instruction opcode."
+          `VXC Dispatcher: ${shapeError}`
+        );
+      }
+
+      if (dispatchCount >= maxInstructions) {
+        throw new Error(
+          "VXC Dispatcher: dispatch instruction limit exceeded."
         );
       }
 
@@ -286,6 +329,9 @@ export function createInstructionDispatcher<TContext>(
           `VXC Dispatcher: no handler for opcode ${instruction.op}.`
         );
       }
+
+      // Count only accepted dispatch attempts.
+      dispatchCount++;
 
       handler(instruction, context);
     },
@@ -317,7 +363,7 @@ export function validateDispatchProgram<TContext>(
   const errors = validateInstructionOperands(program);
 
   if (
-    !Number.isInteger(maxInstructions) ||
+    !Number.isSafeInteger(maxInstructions) ||
     maxInstructions < 1 ||
     maxInstructions > MAX_ALLOWED_INSTRUCTIONS
   ) {
@@ -327,7 +373,6 @@ export function validateDispatchProgram<TContext>(
 
   if (program.instructions.length > maxInstructions) {
     errors.push("VXC Dispatcher: instruction limit exceeded.");
-    return errors;
   }
 
   for (let pc = 0; pc < program.instructions.length; pc++) {
