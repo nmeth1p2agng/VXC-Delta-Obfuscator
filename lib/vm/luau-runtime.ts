@@ -1,3 +1,4 @@
+
 import {
   validateRuntimeHardening,
 } from "./runtime-hardening";
@@ -15,6 +16,7 @@ import {
 } from "./instruction-dispatcher";
 
 const MAX_VM_STEPS = 100000;
+const UINT32_MOD = 4294967296;
 
 const SUPPORTED_OPCODES = new Set<Opcode>([
   OPCODES.LOADK,
@@ -77,6 +79,49 @@ function formatInstruction(
   return `{${instruction.op},${instruction.a},${instruction.b},${instruction.c}}`;
 }
 
+/**
+ * Creates a deterministic fingerprint from the VM payload.
+ * Uses UTF-8 bytes and a 32-bit rolling hash.
+ */
+function createPayloadFingerprint(program: VMProgram): number {
+  const parts: string[] = [];
+
+  for (let i = 0; i < program.constants.length; i++) {
+    const value = program.constants[i];
+    const index = i + 1;
+
+    if (value === null) {
+      parts.push(`C${index}0;`);
+    } else if (value === false) {
+      parts.push(`C${index}1;`);
+    } else if (value === true) {
+      parts.push(`C${index}2;`);
+    } else if (typeof value === "number") {
+      parts.push(`C${index}3${formatNumber(value)};`);
+    } else if (typeof value === "string") {
+      const length = new TextEncoder().encode(value).length;
+      parts.push(`C${index}4${length}:${value};`);
+    } else {
+      throw new Error("VXC Integrity: unsupported constant.");
+    }
+  }
+
+  for (const instruction of program.instructions) {
+    parts.push(
+      `I${instruction.op},${instruction.a},${instruction.b},${instruction.c};`
+    );
+  }
+
+  const bytes = new TextEncoder().encode(parts.join(""));
+  let hash = 2166136261;
+
+  for (const byte of bytes) {
+    hash = (hash * 131 + byte) % UINT32_MOD;
+  }
+
+  return hash;
+}
+
 function validateRuntimeProgram(program: VMProgram): void {
   const errors = validateVMProgram(program);
 
@@ -85,6 +130,7 @@ function validateRuntimeProgram(program: VMProgram): void {
       `VXC Runtime: invalid program: ${errors.join(" ")}`
     );
   }
+
   const hardeningErrors =
     validateRuntimeHardening(program);
 
@@ -93,7 +139,7 @@ function validateRuntimeProgram(program: VMProgram): void {
       `VXC Runtime Hardening: ${hardeningErrors.join(" ")}`
     );
   }
-  
+
   const operandErrors = validateInstructionOperands(program);
 
   if (operandErrors.length > 0) {
@@ -120,8 +166,8 @@ function validateRuntimeProgram(program: VMProgram): void {
 /**
  * Generate a standalone Luau interpreter and payload.
  *
- * This runtime only supports the opcode subset emitted
- * by the current Luau subset compiler.
+ * The generated runtime checks its payload fingerprint
+ * before executing the first instruction.
  */
 export function renderLuauVM(
   program: VMProgram,
@@ -145,6 +191,9 @@ export function renderLuauVM(
     .map(formatInstruction)
     .join(",");
 
+  const expectedFingerprint =
+    createPayloadFingerprint(program);
+
   const payload = `
 local _p = {
     c = {${constants}},
@@ -158,10 +207,69 @@ return (function()
     local _pc = 1
     local _steps = 0
     local _limit = ${maxSteps}
+    local _expected = ${expectedFingerprint}
+
+    local function _fingerprint(payload)
+        local parts = {}
+
+        for index, constant in ipairs(payload.c) do
+            local tag = constant[1]
+
+            if tag == 0 then
+                parts[#parts + 1] = "C" .. index .. "0;"
+
+            elseif tag == 1 then
+                parts[#parts + 1] = "C" .. index .. "1;"
+
+            elseif tag == 2 then
+                parts[#parts + 1] = "C" .. index .. "2;"
+
+            elseif tag == 3 then
+                parts[#parts + 1] =
+                    "C" .. index .. "3" .. tostring(constant[2]) .. ";"
+
+            elseif tag == 4 then
+                local value = constant[2]
+
+                parts[#parts + 1] =
+                    "C" .. index .. "4" .. #value .. ":" .. value .. ";"
+
+            else
+                error("VXC Integrity: invalid constant tag", 0)
+            end
+        end
+
+        for _, instruction in ipairs(payload.i) do
+            parts[#parts + 1] =
+                "I"
+                .. instruction[1] .. ","
+                .. instruction[2] .. ","
+                .. instruction[3] .. ","
+                .. instruction[4] .. ";"
+        end
+
+        local data = table.concat(parts)
+        local hash = 2166136261
+
+        for index = 1, #data do
+            local byte = string.byte(data, index)
+            hash = (hash * 131 + byte) % 4294967296
+        end
+
+        return hash
+    end
+
+    -- Verify payload before executing instructions.
+    if _fingerprint(_p) ~= _expected then
+        error("VXC Integrity: payload modification detected", 0)
+    end
 
     local function _number(value, register)
         if type(value) ~= "number" then
-            error("VXC VM: expected number in register " .. register, 0)
+            error(
+                "VXC VM: expected number in register " .. register,
+                0
+            )
         end
 
         return value
