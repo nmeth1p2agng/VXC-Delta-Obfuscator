@@ -81,7 +81,6 @@ function formatInstruction(
 
 /**
  * Creates a deterministic fingerprint from the VM payload.
- * Uses UTF-8 bytes and a 32-bit rolling hash.
  */
 function createPayloadFingerprint(program: VMProgram): number {
   const parts: string[] = [];
@@ -164,10 +163,8 @@ function validateRuntimeProgram(program: VMProgram): void {
 }
 
 /**
- * Generate a standalone Luau interpreter and payload.
- *
- * The generated runtime checks its payload fingerprint
- * before executing the first instruction.
+ * Generate a standalone Luau interpreter.
+ * Opcode execution uses a dedicated handler table.
  */
 export function renderLuauVM(
   program: VMProgram,
@@ -297,6 +294,60 @@ return (function()
         error("VXC VM: invalid constant type", 0)
     end
 
+    -- Opcode handler table.
+    -- Each handler returns: result, halted.
+    local _handlers = {
+        [${OPCODES.LOADK}] = function(a, b, c)
+            _r[a] = _loadConstant(b)
+            return nil, false
+        end,
+
+        [${OPCODES.MOVE}] = function(a, b, c)
+            _r[a] = _r[b]
+            return nil, false
+        end,
+
+        [${OPCODES.ADD}] = function(a, b, c)
+            _r[a] = _number(_r[b], b) + _number(_r[c], c)
+            return nil, false
+        end,
+
+        [${OPCODES.SUB}] = function(a, b, c)
+            _r[a] = _number(_r[b], b) - _number(_r[c], c)
+            return nil, false
+        end,
+
+        [${OPCODES.MUL}] = function(a, b, c)
+            _r[a] = _number(_r[b], b) * _number(_r[c], c)
+            return nil, false
+        end,
+
+        [${OPCODES.DIV}] = function(a, b, c)
+            _r[a] = _number(_r[b], b) / _number(_r[c], c)
+            return nil, false
+        end,
+
+        [${OPCODES.MOD}] = function(a, b, c)
+            _r[a] = _number(_r[b], b) % _number(_r[c], c)
+            return nil, false
+        end,
+
+        [${OPCODES.POW}] = function(a, b, c)
+            _r[a] = _number(_r[b], b) ^ _number(_r[c], c)
+            return nil, false
+        end,
+
+        [${OPCODES.NEG}] = function(a, b, c)
+            _r[a] = -_number(_r[b], b)
+            return nil, false
+        end,
+
+        [${OPCODES.RETURN}] = function(a, b, c)
+            return _r[a], true
+        end
+    }
+
+    -- Main VM dispatch loop.
     while _pc <= #_p.i do
         _steps += 1
 
@@ -306,43 +357,25 @@ return (function()
 
         local instruction = _p.i[_pc]
 
-        local _op = instruction[1]
-        local _a = instruction[2] + 1
-        local _b = instruction[3] + 1
-        local _c = instruction[4] + 1
+        if type(instruction) ~= "table" then
+            error("VXC VM: malformed instruction", 0)
+        end
 
-        if _op == ${OPCODES.LOADK} then
-            _r[_a] = _loadConstant(_b)
+        local opcode = instruction[1]
+        local handler = _handlers[opcode]
 
-        elseif _op == ${OPCODES.MOVE} then
-            _r[_a] = _r[_b]
+        if type(handler) ~= "function" then
+            error("VXC VM: unknown instruction opcode", 0)
+        end
 
-        elseif _op == ${OPCODES.ADD} then
-            _r[_a] = _number(_r[_b], _b) + _number(_r[_c], _c)
+        local a = instruction[2] + 1
+        local b = instruction[3] + 1
+        local c = instruction[4] + 1
 
-        elseif _op == ${OPCODES.SUB} then
-            _r[_a] = _number(_r[_b], _b) - _number(_r[_c], _c)
+        local result, halted = handler(a, b, c)
 
-        elseif _op == ${OPCODES.MUL} then
-            _r[_a] = _number(_r[_b], _b) * _number(_r[_c], _c)
-
-        elseif _op == ${OPCODES.DIV} then
-            _r[_a] = _number(_r[_b], _b) / _number(_r[_c], _c)
-
-        elseif _op == ${OPCODES.MOD} then
-            _r[_a] = _number(_r[_b], _b) % _number(_r[_c], _c)
-
-        elseif _op == ${OPCODES.POW} then
-            _r[_a] = _number(_r[_b], _b) ^ _number(_r[_c], _c)
-
-        elseif _op == ${OPCODES.NEG} then
-            _r[_a] = -_number(_r[_b], _b)
-
-        elseif _op == ${OPCODES.RETURN} then
-            return _r[_a]
-
-        else
-            error("VXC VM: unknown instruction", 0)
+        if halted then
+            return result
         end
 
         _pc += 1
