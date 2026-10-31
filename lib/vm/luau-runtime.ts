@@ -1,3 +1,8 @@
+import { createExecutionGuard } from "./execution-guard";
+const executionGuard = createExecutionGuard({
+  instructionCount: program.instructions.length,
+  maxSteps: 100_000,
+});
 
 import {
   validateRuntimeHardening,
