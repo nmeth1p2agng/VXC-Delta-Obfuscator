@@ -1,3 +1,4 @@
+
 import {
   validateRuntimeHardening,
 } from "./runtime-hardening";
@@ -57,7 +58,6 @@ function formatConstant(value: VMConstant): string {
 
   if (typeof value === "number") {
     const canonical = formatNumber(value);
-
     return `{3,${formatString(canonical)}}`;
   }
 
@@ -77,12 +77,19 @@ function formatInstruction(
 }
 
 /**
- * Creates a deterministic fingerprint from the VM payload.
+ * Stage 5P-G:
+ * Metadata, constants and instructions are included
+ * in one deterministic payload fingerprint.
  */
 function createPayloadFingerprint(
-  program: VMProgram
+  program: VMProgram,
+  maxSteps: number
 ): number {
   const parts: string[] = [];
+
+  parts.push(
+    `M${program.version},${program.registerCount},${program.constants.length},${program.instructions.length},${maxSteps};`
+  );
 
   for (
     let i = 0;
@@ -202,7 +209,7 @@ function validateRuntimeProgram(
 /**
  * Generate a standalone Luau interpreter.
  *
- * Stage 5P-F:
+ * Stage 5P-G:
  * - Runtime instruction validation
  * - Dedicated opcode handler table
  * - Register initialization tracking
@@ -214,6 +221,7 @@ function validateRuntimeProgram(
  * - Instruction pointer validation
  * - Sequential execution-flow validation
  * - Runtime termination validation
+ * - VM metadata integrity
  */
 export function renderLuauVM(
   program: VMProgram,
@@ -222,7 +230,7 @@ export function renderLuauVM(
   validateRuntimeProgram(program);
 
   if (
-    !Number.isInteger(maxSteps) ||
+    !Number.isSafeInteger(maxSteps) ||
     maxSteps < 1 ||
     maxSteps > 1000000
   ) {
@@ -240,12 +248,13 @@ export function renderLuauVM(
     .join(",");
 
   const expectedFingerprint =
-    createPayloadFingerprint(program);
-
-  const registerLimit = program.registerCount;
+    createPayloadFingerprint(program, maxSteps);
 
   const payload = `
 local _p = {
+    v = ${program.version},
+    r = ${program.registerCount},
+    s = ${maxSteps},
     c = {${constants}},
     i = {${instructions}}
 }
@@ -253,6 +262,59 @@ local _p = {
 
   return `${payload}
 return (function()
+
+    -- =================================
+    -- VM METADATA
+    -- =================================
+
+    local _version = _p.v
+    local _registerLimit = _p.r
+    local _limit = _p.s
+
+    local _constantCount = #_p.c
+    local _instructionCount = #_p.i
+
+    if type(_version) ~= "number"
+        or _version % 1 ~= 0
+        or _version ~= 1 then
+
+        error(
+            "VXC Integrity: invalid VM version",
+            0
+        )
+    end
+
+    if type(_registerLimit) ~= "number"
+        or _registerLimit % 1 ~= 0
+        or _registerLimit < 1
+        or _registerLimit > 65535 then
+
+        error(
+            "VXC Integrity: invalid register metadata",
+            0
+        )
+    end
+
+    if type(_limit) ~= "number"
+        or _limit % 1 ~= 0
+        or _limit < 1
+        or _limit > 1000000 then
+
+        error(
+            "VXC Integrity: invalid step metadata",
+            0
+        )
+    end
+
+    if _constantCount > 100000
+        or _instructionCount < 1
+        or _instructionCount > 100000 then
+
+        error(
+            "VXC Integrity: invalid payload size",
+            0
+        )
+    end
 
     -- =================================
     -- VM STATE
@@ -265,19 +327,49 @@ return (function()
     local _steps = 0
     local _lastPC = 0
 
-    local _limit = ${maxSteps}
-    local _registerLimit = ${registerLimit}
     local _expected = ${expectedFingerprint}
-    local _instructionCount = #_p.i
 
     -- =================================
     -- PAYLOAD FINGERPRINT
     -- =================================
 
     local function _fingerprint(payload)
-        local parts = {}
+
+        local version = payload.v
+        local registers = payload.r
+        local stepLimit = payload.s
+
+        if type(version) ~= "number"
+            or version % 1 ~= 0
+            or type(registers) ~= "number"
+            or registers % 1 ~= 0
+            or type(stepLimit) ~= "number"
+            or stepLimit % 1 ~= 0 then
+
+            error(
+                "VXC Integrity: invalid VM metadata",
+                0
+            )
+        end
+
+        local parts = {
+            "M"
+            .. version .. ","
+            .. registers .. ","
+            .. #payload.c .. ","
+            .. #payload.i .. ","
+            .. stepLimit .. ";"
+        }
 
         for index, constant in ipairs(payload.c) do
+
+            if type(constant) ~= "table" then
+                error(
+                    "VXC Integrity: malformed constant",
+                    0
+                )
+            end
+
             local tag = constant[1]
 
             if tag == 0 then
@@ -329,7 +421,10 @@ return (function()
         end
 
         for _, instruction in ipairs(payload.i) do
-            if type(instruction) ~= "table" then
+
+            if type(instruction) ~= "table"
+                or #instruction ~= 4 then
+
                 error(
                     "VXC Integrity: malformed instruction",
                     0
@@ -370,6 +465,7 @@ return (function()
     -- =================================
 
     local function _validateRegister(index)
+
         if type(index) ~= "number"
             or index % 1 ~= 0
             or index < 1
@@ -383,16 +479,15 @@ return (function()
     end
 
     local function _writeRegister(index, value)
+
         _validateRegister(index)
 
         _r[index] = value
-
-        -- Track initialization separately.
-        -- This also supports registers containing nil.
         _initialized[index] = true
     end
 
     local function _readRegister(index)
+
         _validateRegister(index)
 
         if not _initialized[index] then
@@ -410,6 +505,7 @@ return (function()
     -- =================================
 
     local function _number(value, register)
+
         if type(value) ~= "number"
             or value ~= value
             or value == math.huge
@@ -430,6 +526,7 @@ return (function()
     -- =================================
 
     local function _loadConstant(index)
+
         if type(index) ~= "number"
             or index % 1 ~= 0
             or index < 1
@@ -462,6 +559,7 @@ return (function()
             return true
 
         elseif tag == 3 then
+
             local value = tonumber(constant[2])
 
             if type(value) ~= "number"
@@ -478,6 +576,7 @@ return (function()
             return value
 
         elseif tag == 4 then
+
             if type(constant[2]) ~= "string" then
                 error(
                     "VXC VM: invalid string constant",
@@ -501,6 +600,7 @@ return (function()
     local _handlers = {
 
         [${OPCODES.LOADK}] = function(a, b, c)
+
             _writeRegister(
                 a,
                 _loadConstant(b)
@@ -510,6 +610,7 @@ return (function()
         end,
 
         [${OPCODES.MOVE}] = function(a, b, c)
+
             _writeRegister(
                 a,
                 _readRegister(b)
@@ -519,6 +620,7 @@ return (function()
         end,
 
         [${OPCODES.ADD}] = function(a, b, c)
+
             _writeRegister(
                 a,
                 _number(_readRegister(b), b)
@@ -529,6 +631,7 @@ return (function()
         end,
 
         [${OPCODES.SUB}] = function(a, b, c)
+
             _writeRegister(
                 a,
                 _number(_readRegister(b), b)
@@ -539,6 +642,7 @@ return (function()
         end,
 
         [${OPCODES.MUL}] = function(a, b, c)
+
             _writeRegister(
                 a,
                 _number(_readRegister(b), b)
@@ -549,6 +653,7 @@ return (function()
         end,
 
         [${OPCODES.DIV}] = function(a, b, c)
+
             _writeRegister(
                 a,
                 _number(_readRegister(b), b)
@@ -559,6 +664,7 @@ return (function()
         end,
 
         [${OPCODES.MOD}] = function(a, b, c)
+
             _writeRegister(
                 a,
                 _number(_readRegister(b), b)
@@ -569,6 +675,7 @@ return (function()
         end,
 
         [${OPCODES.POW}] = function(a, b, c)
+
             _writeRegister(
                 a,
                 _number(_readRegister(b), b)
@@ -579,6 +686,7 @@ return (function()
         end,
 
         [${OPCODES.NEG}] = function(a, b, c)
+
             _writeRegister(
                 a,
                 -_number(_readRegister(b), b)
@@ -588,6 +696,7 @@ return (function()
         end,
 
         [${OPCODES.RETURN}] = function(a, b, c)
+
             return _readRegister(a), true
         end
     }
@@ -597,6 +706,7 @@ return (function()
     -- =================================
 
     local function _validatePC(pc)
+
         if type(pc) ~= "number"
             or pc % 1 ~= 0
             or pc < 1
@@ -610,6 +720,7 @@ return (function()
     end
 
     local function _validateFlow(pc)
+
         _validatePC(pc)
 
         if pc ~= _lastPC + 1 then
@@ -628,10 +739,8 @@ return (function()
 
     while _pc <= _instructionCount do
 
-        -- Validate instruction pointer and order.
         _validateFlow(_pc)
 
-        -- Execution step protection.
         _steps += 1
 
         if _steps > _limit then
@@ -687,8 +796,9 @@ return (function()
             )
         end
 
-        -- Compiler register indexes are zero-based.
-        -- Runtime register indexes are one-based.
+        -- Compiler indexes are zero-based.
+        -- Runtime indexes are one-based.
+
         local a = rawA + 1
         local b = rawB + 1
         local c = rawC + 1
@@ -699,8 +809,6 @@ return (function()
             return result
         end
 
-        -- No jump instructions are supported yet.
-        -- Execution must continue sequentially.
         if _pc ~= currentPC then
             error(
                 "VXC VM: unexpected instruction pointer modification",
