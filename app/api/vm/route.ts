@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { compileToLuauVM } from "../../../../lib/vm/vm-pipeline";
+import { compileToLuauVM } from "../../../lib/vm/vm-pipeline";
 
 export const runtime = "nodejs";
 
