@@ -1,4 +1,8 @@
 import {
+  validateRuntimeHardening,
+} from "./runtime-hardening";
+
+import {
   OPCODES,
   validateVMProgram,
   type VMProgram,
@@ -81,7 +85,15 @@ function validateRuntimeProgram(program: VMProgram): void {
       `VXC Runtime: invalid program: ${errors.join(" ")}`
     );
   }
+  const hardeningErrors =
+    validateRuntimeHardening(program);
 
+  if (hardeningErrors.length > 0) {
+    throw new Error(
+      `VXC Runtime Hardening: ${hardeningErrors.join(" ")}`
+    );
+  }
+  
   const operandErrors = validateInstructionOperands(program);
 
   if (operandErrors.length > 0) {
