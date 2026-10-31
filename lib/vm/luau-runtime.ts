@@ -1,9 +1,3 @@
-import { createExecutionGuard } from "./execution-guard";
-const executionGuard = createExecutionGuard({
-  instructionCount: program.instructions.length,
-  maxSteps: 100_000,
-});
-
 import {
   validateRuntimeHardening,
 } from "./runtime-hardening";
@@ -208,7 +202,7 @@ function validateRuntimeProgram(
 /**
  * Generate a standalone Luau interpreter.
  *
- * Stage 5P-E:
+ * Stage 5P-F:
  * - Runtime instruction validation
  * - Dedicated opcode handler table
  * - Register initialization tracking
@@ -217,6 +211,9 @@ function validateRuntimeProgram(
  * - Canonical numeric constants
  * - Payload fingerprint verification
  * - Execution step limit
+ * - Instruction pointer validation
+ * - Sequential execution-flow validation
+ * - Runtime termination validation
  */
 export function renderLuauVM(
   program: VMProgram,
@@ -256,6 +253,7 @@ local _p = {
 
   return `${payload}
 return (function()
+
     -- =================================
     -- VM STATE
     -- =================================
@@ -265,10 +263,12 @@ return (function()
 
     local _pc = 1
     local _steps = 0
+    local _lastPC = 0
 
     local _limit = ${maxSteps}
     local _registerLimit = ${registerLimit}
     local _expected = ${expectedFingerprint}
+    local _instructionCount = #_p.i
 
     -- =================================
     -- PAYLOAD FINGERPRINT
@@ -499,6 +499,7 @@ return (function()
     -- =================================
 
     local _handlers = {
+
         [${OPCODES.LOADK}] = function(a, b, c)
             _writeRegister(
                 a,
@@ -592,10 +593,45 @@ return (function()
     }
 
     -- =================================
+    -- EXECUTION FLOW GUARD
+    -- =================================
+
+    local function _validatePC(pc)
+        if type(pc) ~= "number"
+            or pc % 1 ~= 0
+            or pc < 1
+            or pc > _instructionCount then
+
+            error(
+                "VXC VM: invalid instruction pointer",
+                0
+            )
+        end
+    end
+
+    local function _validateFlow(pc)
+        _validatePC(pc)
+
+        if pc ~= _lastPC + 1 then
+            error(
+                "VXC VM: execution flow violation",
+                0
+            )
+        end
+
+        _lastPC = pc
+    end
+
+    -- =================================
     -- VM DISPATCH LOOP
     -- =================================
 
-    while _pc <= #_p.i do
+    while _pc <= _instructionCount do
+
+        -- Validate instruction pointer and order.
+        _validateFlow(_pc)
+
+        -- Execution step protection.
         _steps += 1
 
         if _steps > _limit then
@@ -605,7 +641,8 @@ return (function()
             )
         end
 
-        local instruction = _p.i[_pc]
+        local currentPC = _pc
+        local instruction = _p.i[currentPC]
 
         if type(instruction) ~= "table" then
             error(
@@ -626,20 +663,19 @@ return (function()
         local rawB = instruction[3]
         local rawC = instruction[4]
 
-        for _, operand in ipairs({
-            opcode,
-            rawA,
-            rawB,
-            rawC
-        }) do
-            if type(operand) ~= "number"
-                or operand % 1 ~= 0 then
+        if type(opcode) ~= "number"
+            or opcode % 1 ~= 0
+            or type(rawA) ~= "number"
+            or rawA % 1 ~= 0
+            or type(rawB) ~= "number"
+            or rawB % 1 ~= 0
+            or type(rawC) ~= "number"
+            or rawC % 1 ~= 0 then
 
-                error(
-                    "VXC VM: malformed instruction operand",
-                    0
-                )
-            end
+            error(
+                "VXC VM: malformed instruction operand",
+                0
+            )
         end
 
         local handler = _handlers[opcode]
@@ -657,17 +693,37 @@ return (function()
         local b = rawB + 1
         local c = rawC + 1
 
-        local result, halted =
-            handler(a, b, c)
+        local result, halted = handler(a, b, c)
 
         if halted then
             return result
         end
 
-        _pc += 1
+        -- No jump instructions are supported yet.
+        -- Execution must continue sequentially.
+        if _pc ~= currentPC then
+            error(
+                "VXC VM: unexpected instruction pointer modification",
+                0
+            )
+        end
+
+        _pc = currentPC + 1
+    end
+
+    -- =================================
+    -- EXECUTION TERMINATION
+    -- =================================
+
+    if _pc ~= _instructionCount + 1 then
+        error(
+            "VXC VM: invalid execution termination",
+            0
+        )
     end
 
     return nil
+
 end)()
 `;
 }
