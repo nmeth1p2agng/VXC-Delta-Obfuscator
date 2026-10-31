@@ -104,12 +104,55 @@ function findStatementEnd(tokens: LuauToken[], source: string, start: number): n
   return tokens.length;
 }
 
+function isTableConstructorKey(tokens: LuauToken[], index: number): boolean {
+  if (tokens[index + 1]?.value !== "=") return false;
+
+  // Find the innermost unmatched table-constructor brace before this token.
+  // This avoids mistaking ordinary assignment targets such as `a, b = x, y`
+  // for table keys merely because they follow a comma.
+  const braceStack: number[] = [];
+  for (let i = 0; i < index; i++) {
+    if (tokens[i].value === "{") braceStack.push(i);
+    else if (tokens[i].value === "}") braceStack.pop();
+  }
+  const open = braceStack[braceStack.length - 1];
+  if (open === undefined) return false;
+
+  let round = 0;
+  let square = 0;
+  let curly = 0;
+  let blockDepth = 0;
+  let lastTopLevel: string | undefined = "{";
+
+  for (let i = open + 1; i < index; i++) {
+    const value = tokens[i].value;
+    if (round === 0 && square === 0 && curly === 0 && blockDepth === 0) {
+      if (value === "," || value === ";") lastTopLevel = value;
+      else if (lastTopLevel === "{" || lastTopLevel === "," || lastTopLevel === ";") {
+        // Keep the field-start marker until a real field expression begins.
+        if (value !== "[") lastTopLevel = "expression";
+      }
+    }
+
+    if (value === "(") round++;
+    else if (value === ")") round = Math.max(0, round - 1);
+    else if (value === "[") square++;
+    else if (value === "]") square = Math.max(0, square - 1);
+    else if (value === "{") curly++;
+    else if (value === "}") curly = Math.max(0, curly - 1);
+
+    if (["function", "if", "do", "for", "while", "repeat"].includes(value)) blockDepth++;
+    else if (value === "end" || value === "until") blockDepth = Math.max(0, blockDepth - 1);
+  }
+
+  return round === 0 && square === 0 && curly === 0 && blockDepth === 0 &&
+    (lastTopLevel === "{" || lastTopLevel === "," || lastTopLevel === ";");
+}
+
 function isPropertyOrKey(tokens: LuauToken[], index: number): boolean {
   const previous = tokens[index - 1];
-  const next = tokens[index + 1];
   if (previous?.value === "." || previous?.value === ":" || previous?.value === "::") return true;
-  if (next?.value === "=" && (previous?.value === "{" || previous?.value === ",")) return true;
-  return false;
+  return isTableConstructorKey(tokens, index);
 }
 
 function inTypeContext(tokens: LuauToken[], index: number): boolean {
